@@ -3,15 +3,19 @@
 Sender:
   1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
      populates it with multiple requests.
-  2. For each layer, gathers only the target requests' KV into a contiguous
-     export tensor, copies to pinned CPU memory (async D2H with double
-     buffering), writes to a memfd, and sends the fd.
-  3. Waits only for a lightweight ACK ("fd opened") before proceeding.
+  2. For each layer, gathers the target requests' KV on the GPU, creates
+     an mmap'd memfd, pins the payload region (cudaHostRegister under the
+     hood via torch pin_memory), and performs a single synchronous D2H
+     copy into the pinned mmap.  No separate pinned staging buffer or
+     host-to-host copy.
+  3. Sends the memfd fd and waits for a lightweight ACK before proceeding
+     to the next layer.
 
 Receiver:
   1. Parses the header, sends ACK immediately.
-  2. Enqueues background work to copy the mmap payload into a contiguous
-     CPU torch.Tensor via zero-copy torch.frombuffer + clone.
+  2. Returns zero-copy tensor views backed by the mmap'd memfd payload
+     (no host-to-host clone).  The mmap objects are kept alive until
+     the caller is done with the tensors.
 
 Wire layout per layer (after v3 header):
   Contiguous tensor of shape (num_targets, seq_len, 2, num_kv_heads, head_dim)
@@ -19,7 +23,6 @@ Wire layout per layer (after v3 header):
 """
 
 import argparse
-import ctypes
 import logging
 import mmap
 import os
@@ -67,44 +70,6 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
             raise ConnectionError("Socket closed before all bytes received")
         buf.extend(chunk)
     return bytes(buf)
-
-
-# -- memfd I/O helpers --------------------------------------------------------
-
-
-def _write_tensor_bytes(fd: int, tensor: torch.Tensor, nbytes: int) -> None:
-    """Write entire buffer to *fd*, handling short writes."""
-    raw = (ctypes.c_byte * nbytes).from_address(tensor.data_ptr())
-    os.write(fd, raw)
-
-
-def _send_memfd(
-    pinned: torch.Tensor,
-    hdr: Header,
-    sock: socket.socket,
-    logger: logging.Logger,
-):
-    """Create a memfd, write header + tensor payload via write(), and send the fd."""
-    assert pinned.is_contiguous(), "pinned staging buffer must be contiguous"
-
-    hdr_bytes = hdr.to_bytes()
-    fd = os.memfd_create(f"kv_layer_{hdr.layer_idx}")
-
-    t0 = time.perf_counter()
-    os.write(fd, hdr_bytes)
-    _write_tensor_bytes(fd, pinned, hdr.tensor_size)
-    write_elapsed = time.perf_counter() - t0
-
-    socket.send_fds(sock, [b"1"], [fd])
-    logger.info(
-        "Layer %d/%d memfd sent (%.2f MB, write %.1f ms, %.2f MB/s).",
-        hdr.layer_idx,
-        hdr.num_layers - 1,
-        hdr.tensor_size / (1024**2),
-        write_elapsed * 1000,
-        hdr.tensor_size / (1024**2) / write_elapsed if write_elapsed > 0 else 0,
-    )
-    os.close(fd)
 
 
 # -- sender -------------------------------------------------------------------
@@ -159,11 +124,22 @@ def run_sender(
         export_bytes / (1024**2),
     )
 
-    # 2. Double-buffered pinned CPU staging + CUDA stream
-    pinned = [torch.empty(export_numel, dtype=dtype).pin_memory() for _ in range(2)]
-    stream = torch.cuda.Stream()
+    # Pre-compute header fields that are constant across layers
+    hdr_kwargs = dict(
+        num_layers=pool.num_layers,
+        tensor_size=export_bytes,
+        block_size=block_size,
+        num_kv_heads=pool.num_kv_heads,
+        head_dim=pool.head_dim,
+        dtype_id=DTYPE_ID[profile.dtype_name],
+        seq_len=seq_len,
+        num_targets=num_targets,
+        target_indices=tuple(target_indices),
+    )
+    hdr_size = Header(layer_idx=0, **hdr_kwargs).total_header_size
+    file_size = hdr_size + export_bytes
 
-    # 3. Connect and transfer
+    # 2. Connect and transfer
     logger.info("Connecting to %s ...", socket_path)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         while True:
@@ -174,56 +150,68 @@ def run_sender(
                 time.sleep(0.5)
 
         transfer_start = time.perf_counter()
-        prev_hdr: Header | None = None
-        buf_idx = 0
 
         for layer_idx in range(pool.num_layers):
-            # Gather target requests on GPU
+            t0 = time.perf_counter()
             gathered = gather_kv(
                 pool.kv_caches[layer_idx],
                 block_tables,
                 target_indices,
                 seq_len,
             )
+            torch.cuda.synchronize()
+            gather_elapsed = time.perf_counter() - t0
 
-            # Async D2H into current pinned buffer
-            with torch.cuda.stream(stream):
-                pinned[buf_idx].copy_(gathered.view(-1), non_blocking=True)
+            hdr = Header(layer_idx=layer_idx, **hdr_kwargs)
 
-            # Overlap: send previous layer's memfd while D2H runs
-            if prev_hdr is not None:
-                _send_memfd(pinned[1 - buf_idx], prev_hdr, sock, logger)
-                ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
-                if ack_layer != prev_hdr.layer_idx:
-                    raise RuntimeError(
-                        f"ACK mismatch: expected {prev_hdr.layer_idx}, got {ack_layer}"
-                    )
+            # Create memfd, size it, mmap, write header
+            fd = os.memfd_create(f"kv_layer_{layer_idx}")
+            os.ftruncate(fd, file_size)
+            mm = mmap.mmap(fd, file_size)
 
-            # Wait for D2H to finish
-            stream.synchronize()
+            # Pin mmap region
+            t1 = time.perf_counter()
+            buffer = torch.frombuffer(
+                mm,
+                dtype=dtype,
+                offset=hdr_size,
+                count=export_numel,
+            ).pin_memory()
+            pin_elapsed = time.perf_counter() - t1
 
-            prev_hdr = Header(
-                layer_idx=layer_idx,
-                num_layers=pool.num_layers,
-                tensor_size=export_bytes,
-                block_size=block_size,
-                num_kv_heads=pool.num_kv_heads,
-                head_dim=pool.head_dim,
-                dtype_id=DTYPE_ID[profile.dtype_name],
-                seq_len=seq_len,
-                num_targets=num_targets,
-                target_indices=tuple(target_indices),
-            )
-            buf_idx = 1 - buf_idx
+            # Then single D2H: GPU gathered → pinned mmap payload
+            t2 = time.perf_counter()
+            mm[0:hdr_size] = hdr.to_bytes()
+            buffer.copy_(gathered.view(-1))
+            copy_elapsed = time.perf_counter() - t2
 
-        # Flush last layer
-        if prev_hdr is not None:
-            _send_memfd(pinned[1 - buf_idx], prev_hdr, sock, logger)
+            t3 = time.perf_counter()
+            socket.send_fds(sock, [b"1"], [fd])
+            mm.close()
+            os.close(fd)
+            send_elapsed = time.perf_counter() - t3
+
+            t4 = time.perf_counter()
             ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
-            if ack_layer != prev_hdr.layer_idx:
+            if ack_layer != hdr.layer_idx:
                 raise RuntimeError(
-                    f"ACK mismatch: expected {prev_hdr.layer_idx}, got {ack_layer}"
+                    f"ACK mismatch: expected {hdr.layer_idx}, got {ack_layer}"
                 )
+            ack_elapsed = time.perf_counter() - t4
+
+            layer_elapsed = time.perf_counter() - t0
+            logger.info(
+                "Layer %d/%d memfd sent in %.2f ms (%.2f MB/s). Gather: %.2f ms, Copy: %.2f ms, Pin: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
+                hdr.layer_idx,
+                hdr.num_layers - 1,
+                layer_elapsed * 1000,
+                hdr.tensor_size / (1024**2) / layer_elapsed if layer_elapsed > 0 else 0,
+                gather_elapsed * 1000,
+                copy_elapsed * 1000,
+                pin_elapsed * 1000,
+                send_elapsed * 1000,
+                ack_elapsed * 1000,
+            )
 
         elapsed = time.perf_counter() - transfer_start
         total_bytes = pool.num_layers * export_bytes
@@ -244,24 +232,25 @@ def _process_layer(
     mm: mmap.mmap,
     hdr: Header,
     logger: logging.Logger,
-) -> torch.Tensor:
-    """Background: build a contiguous CPU tensor from the mmap payload."""
+) -> tuple[torch.Tensor, mmap.mmap]:
+    """Build a zero-copy CPU tensor view backed by the mmap payload.
+
+    The returned mmap must stay open for the tensor's lifetime; the caller
+    is responsible for closing it after the tensor is no longer needed.
+    """
     t0 = time.perf_counter()
 
     dtype_name = ID_TO_DTYPE_NAME[hdr.dtype_id]
     dtype = TORCH_DTYPE[dtype_name]
     num_elements = hdr.tensor_size // DTYPE_BYTES[dtype_name]
 
-    # Zero-copy view of mmap → clone to own the memory
-    tensor = (
-        torch.frombuffer(
-            mm, dtype=dtype, offset=hdr.total_header_size, count=num_elements
-        )
-        .clone()
-        .reshape(hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
-    )
+    tensor = torch.frombuffer(
+        mm,
+        dtype=dtype,
+        offset=hdr.total_header_size,
+        count=num_elements,
+    ).reshape(hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
 
-    mm.close()
     os.close(fd)
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -272,7 +261,7 @@ def _process_layer(
         tensor.shape,
         tensor.dtype,
     )
-    return tensor
+    return tensor, mm
 
 
 def run_receiver(socket_path: str):
@@ -336,9 +325,13 @@ def run_receiver(socket_path: str):
             )
 
             results: dict[int, torch.Tensor] = {}
+            keepalives: list[mmap.mmap] = []
             for layer_idx, fut in futures:
-                results[layer_idx] = fut.result()
+                tensor, mm = fut.result()
+                results[layer_idx] = tensor
+                keepalives.append(mm)
             executor.shutdown()
+            futures.clear()
 
             total_elapsed = time.perf_counter() - transfer_start
             logger.info(
@@ -347,6 +340,11 @@ def run_receiver(socket_path: str):
                 total_elapsed,
                 len(results),
             )
+
+            # Release tensor views, then close mmap backings
+            results.clear()
+            for mm in keepalives:
+                mm.close()
 
 
 # -- CLI -----------------------------------------------------------------------

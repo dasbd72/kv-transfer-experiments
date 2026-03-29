@@ -3,9 +3,9 @@
 Sender:
   1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
      populates it with multiple requests.
-  2. For each layer, gathers only the target requests' KV into a contiguous
-     export tensor, copies to pinned CPU memory (async D2H with double
-     buffering), and sends header + raw tensor bytes over the socket.
+  2. For each layer, gathers the target requests' KV on the GPU, copies to a
+     pinned CPU buffer (synchronous D2H), then sends header + raw tensor bytes
+     over the socket.
   3. Waits for a lightweight ACK before proceeding to the next layer.
 
 Receiver:
@@ -58,47 +58,22 @@ def _unpack_ack(data: bytes) -> int:
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    """Receive exactly *n* bytes from *sock*."""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Socket closed before all bytes received")
-        buf.extend(chunk)
+    """Receive exactly *n* bytes from *sock* (small reads; prefer recv_into for large)."""
+    buf = bytearray(n)
+    _recv_exact_into(sock, buf)
     return bytes(buf)
 
 
-# -- socket I/O helpers -------------------------------------------------------
-
-
-def _send_tensor_bytes(sock: socket.socket, tensor: torch.Tensor, nbytes: int):
-    """Send *nbytes* of raw tensor storage over *sock* (zero-copy read)."""
-    raw = (ctypes.c_byte * nbytes).from_address(tensor.data_ptr())
-    sock.sendall(raw)
-
-
-def _send_layer(
-    pinned: torch.Tensor,
-    hdr: Header,
-    sock: socket.socket,
-    logger: logging.Logger,
-):
-    """Send header + tensor payload directly over the socket."""
-    hdr_bytes = hdr.to_bytes()
-
-    t0 = time.perf_counter()
-    sock.sendall(hdr_bytes)
-    _send_tensor_bytes(sock, pinned, hdr.tensor_size)
-    send_elapsed = time.perf_counter() - t0
-
-    logger.info(
-        "Layer %d/%d socket sent (%.2f MB, send %.1f ms, %.2f MB/s).",
-        hdr.layer_idx,
-        hdr.num_layers - 1,
-        hdr.tensor_size / (1024**2),
-        send_elapsed * 1000,
-        hdr.tensor_size / (1024**2) / send_elapsed if send_elapsed > 0 else 0,
-    )
+def _recv_exact_into(sock: socket.socket, buf: bytearray) -> None:
+    """Fill *buf* exactly from *sock* using recv_into (no incremental realloc)."""
+    mv = memoryview(buf)
+    pos = 0
+    n = len(buf)
+    while pos < n:
+        got = sock.recv_into(mv[pos:])
+        if got == 0:
+            raise ConnectionError("Socket closed before all bytes received")
+        pos += got
 
 
 # -- sender -------------------------------------------------------------------
@@ -153,11 +128,22 @@ def run_sender(
         export_bytes / (1024**2),
     )
 
-    # 2. Double-buffered pinned CPU staging + CUDA stream
-    pinned = [torch.empty(export_numel, dtype=dtype).pin_memory() for _ in range(2)]
-    stream = torch.cuda.Stream()
+    # Pre-compute header fields that are constant across layers
+    hdr_kwargs = dict(
+        num_layers=pool.num_layers,
+        tensor_size=export_bytes,
+        block_size=block_size,
+        num_kv_heads=pool.num_kv_heads,
+        head_dim=pool.head_dim,
+        dtype_id=DTYPE_ID[profile.dtype_name],
+        seq_len=seq_len,
+        num_targets=num_targets,
+        target_indices=tuple(target_indices),
+    )
 
-    # 3. Connect and transfer
+    pinned = torch.empty(export_numel, dtype=dtype).pin_memory()
+
+    # 2. Connect and transfer
     logger.info("Connecting to %s ...", socket_path)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         while True:
@@ -168,56 +154,51 @@ def run_sender(
                 time.sleep(0.5)
 
         transfer_start = time.perf_counter()
-        prev_hdr: Header | None = None
-        buf_idx = 0
 
         for layer_idx in range(pool.num_layers):
-            # Gather target requests on GPU
+            t0 = time.perf_counter()
             gathered = gather_kv(
                 pool.kv_caches[layer_idx],
                 block_tables,
                 target_indices,
                 seq_len,
             )
+            torch.cuda.synchronize()
+            gather_elapsed = time.perf_counter() - t0
 
-            # Async D2H into current pinned buffer
-            with torch.cuda.stream(stream):
-                pinned[buf_idx].copy_(gathered.view(-1), non_blocking=True)
+            hdr = Header(layer_idx=layer_idx, **hdr_kwargs)
 
-            # Overlap: send previous layer while D2H runs
-            if prev_hdr is not None:
-                _send_layer(pinned[1 - buf_idx], prev_hdr, sock, logger)
-                ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
-                if ack_layer != prev_hdr.layer_idx:
-                    raise RuntimeError(
-                        f"ACK mismatch: expected {prev_hdr.layer_idx}, got {ack_layer}"
-                    )
+            # Single synchronous D2H: GPU gathered → pinned buffer
+            t1 = time.perf_counter()
+            pinned.copy_(gathered.view(-1))
+            copy_elapsed = time.perf_counter() - t1
 
-            # Wait for D2H to finish
-            stream.synchronize()
+            t2 = time.perf_counter()
+            raw = (ctypes.c_byte * hdr.tensor_size).from_address(pinned.data_ptr())
+            sock.sendall(hdr.to_bytes())
+            sock.sendall(raw)
+            send_elapsed = time.perf_counter() - t2
 
-            prev_hdr = Header(
-                layer_idx=layer_idx,
-                num_layers=pool.num_layers,
-                tensor_size=export_bytes,
-                block_size=block_size,
-                num_kv_heads=pool.num_kv_heads,
-                head_dim=pool.head_dim,
-                dtype_id=DTYPE_ID[profile.dtype_name],
-                seq_len=seq_len,
-                num_targets=num_targets,
-                target_indices=tuple(target_indices),
-            )
-            buf_idx = 1 - buf_idx
-
-        # Flush last layer
-        if prev_hdr is not None:
-            _send_layer(pinned[1 - buf_idx], prev_hdr, sock, logger)
+            t3 = time.perf_counter()
             ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
-            if ack_layer != prev_hdr.layer_idx:
+            if ack_layer != hdr.layer_idx:
                 raise RuntimeError(
-                    f"ACK mismatch: expected {prev_hdr.layer_idx}, got {ack_layer}"
+                    f"ACK mismatch: expected {hdr.layer_idx}, got {ack_layer}"
                 )
+            ack_elapsed = time.perf_counter() - t3
+
+            layer_elapsed = time.perf_counter() - t0
+            logger.info(
+                "Layer %d/%d socket sent in %.2f ms (%.2f MB/s). Gather: %.2f ms, Copy: %.2f ms. Send: %.2f ms. Ack: %.2f ms.",
+                hdr.layer_idx,
+                hdr.num_layers - 1,
+                layer_elapsed * 1000,
+                hdr.tensor_size / (1024**2) / layer_elapsed if layer_elapsed > 0 else 0,
+                gather_elapsed * 1000,
+                copy_elapsed * 1000,
+                send_elapsed * 1000,
+                ack_elapsed * 1000,
+            )
 
         elapsed = time.perf_counter() - transfer_start
         total_bytes = pool.num_layers * export_bytes
@@ -234,7 +215,7 @@ def run_sender(
 
 
 def _process_layer(
-    payload: bytes,
+    payload: bytearray,
     hdr: Header,
     logger: logging.Logger,
 ) -> torch.Tensor:
@@ -245,11 +226,8 @@ def _process_layer(
     dtype = TORCH_DTYPE[dtype_name]
     num_elements = hdr.tensor_size // DTYPE_BYTES[dtype_name]
 
-    # Writable copy via bytearray → clone to own the memory
-    tensor = (
-        torch.frombuffer(bytearray(payload), dtype=dtype, count=num_elements)
-        .clone()
-        .reshape(hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
+    tensor = torch.frombuffer(payload, dtype=dtype, count=num_elements).reshape(
+        hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim
     )
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -284,12 +262,12 @@ def run_receiver(socket_path: str):
 
             while True:
                 # Two-phase header read: fixed portion, then variable indices
-                fixed = _recv_exact(conn, Header.SIZE)
-                num_targets = struct.unpack(">I", fixed[-4:])[0]
-                indices_bytes = b""
+                hdr_fixed = _recv_exact(conn, Header.SIZE)
+                num_targets = struct.unpack(">I", hdr_fixed[-4:])[0]
+                hdr_dynamic = b""
                 if num_targets > 0:
-                    indices_bytes = _recv_exact(conn, num_targets * 4)
-                hdr = Header.from_bytes(fixed + indices_bytes)
+                    hdr_dynamic = _recv_exact(conn, num_targets * 4)
+                hdr = Header.from_bytes(hdr_fixed + hdr_dynamic)
 
                 if transfer_start is None:
                     transfer_start = time.perf_counter()
@@ -303,8 +281,9 @@ def run_receiver(socket_path: str):
                         hdr.tensor_size / (1024**2),
                     )
 
-                # Receive tensor payload
-                payload = _recv_exact(conn, hdr.tensor_size)
+                # Receive tensor payload (single alloc + recv_into)
+                payload = bytearray(hdr.tensor_size)
+                _recv_exact_into(conn, payload)
                 total_bytes += hdr.tensor_size
 
                 # ACK immediately — sender can proceed
@@ -330,6 +309,7 @@ def run_receiver(socket_path: str):
             for layer_idx, fut in futures:
                 results[layer_idx] = fut.result()
             executor.shutdown()
+            futures.clear()
 
             total_elapsed = time.perf_counter() - transfer_start
             logger.info(
