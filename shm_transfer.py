@@ -4,10 +4,10 @@ Sender:
   1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
      populates it with multiple requests.
   2. For each layer, gathers the target requests' KV on the GPU, creates
-     a sized file under /dev/shm, mmap's it, and performs a single
-     synchronous D2H copy directly into the mmap payload (pageable host
-     memory backing the mapping).  No separate staging buffer or
-     host-to-host copy.
+     a sized file under /dev/shm (size rounded up to a host page), mmap's
+     it, registers the mapping with cudaHostRegister so the buffer is
+     pinned for CUDA, then performs a synchronous D2H copy into the
+     payload.  No separate staging buffer or host-to-host copy.
   3. Sends the absolute shm path (length-prefixed) and waits for a
      lightweight ACK before unlinking the file and proceeding to the
      next layer.
@@ -24,6 +24,7 @@ Wire layout per layer (after v3 header):
 """
 
 import argparse
+import ctypes
 import logging
 import mmap
 import os
@@ -49,6 +50,31 @@ from kv_layout import (
 
 ACK_SIZE = 5  # b"A" + big-endian uint32 layer index
 PATH_LEN_SIZE = 4  # big-endian uint32 path byte length
+
+# cudaHostRegisterPortable — same flag as torch.cuda._pin_memory_utils.pin_memory
+_CUDA_HOST_REGISTER_PORTABLE = 1
+
+
+def _round_up_page(nbytes: int, page: int) -> int:
+    return (nbytes + page - 1) // page * page
+
+
+def _cuda_host_register(ptr: int, nbytes: int) -> None:
+    """Pin existing host memory for fast DMA (wraps cudaHostRegister)."""
+    err = int(
+        torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_PORTABLE)
+    )
+    if err != 0:
+        raise RuntimeError(
+            f"cudaHostRegister failed with error code {err}. "
+            "Set CUDA_LAUNCH_BLOCKING=1 if this may mask an earlier async CUDA error."
+        )
+
+
+def _cuda_host_unregister(ptr: int) -> None:
+    err = int(torch.cuda.cudart().cudaHostUnregister(ptr))
+    if err != 0:
+        raise RuntimeError(f"cudaHostUnregister failed with error code {err}")
 
 
 # -- ACK helpers --------------------------------------------------------------
@@ -152,6 +178,8 @@ def run_sender(
     )
     hdr_size = Header(layer_idx=0, **hdr_kwargs).total_header_size
     file_size = hdr_size + export_bytes
+    page = os.sysconf("SC_PAGE_SIZE")
+    map_size = _round_up_page(file_size, page)
 
     # 2. Connect and transfer
     logger.info("Connecting to %s ...", socket_path)
@@ -184,8 +212,16 @@ def run_sender(
             )
             fd = os.open(shm_path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
-                os.ftruncate(fd, file_size)
-                mm = mmap.mmap(fd, file_size)
+                # mmap; register full mapping for pinned D2H
+                os.ftruncate(fd, map_size)
+                mm = mmap.mmap(fd, map_size)
+                whole = (ctypes.c_byte * map_size).from_buffer(mm, 0)
+                base_ptr = ctypes.addressof(whole)
+
+                t_register = time.perf_counter()
+                _cuda_host_register(base_ptr, map_size)
+                register_elapsed = time.perf_counter() - t_register
+
                 buffer = torch.frombuffer(
                     mm,
                     dtype=dtype,
@@ -197,6 +233,17 @@ def run_sender(
                 mm[0:hdr_size] = hdr.to_bytes()
                 buffer.copy_(gathered.view(-1))
                 copy_elapsed = time.perf_counter() - t1
+
+                # Drop buffer/ctypes views before mm.close(): mmap refuses to
+                # close while buffer exports (frombuffer / from_buffer) exist.
+                if buffer is not None:
+                    del buffer
+                del whole
+                t_unregister = time.perf_counter()
+                _cuda_host_unregister(base_ptr)
+                unregister_elapsed = time.perf_counter() - t_unregister
+
+                pin_elapsed = register_elapsed + unregister_elapsed
 
                 t2 = time.perf_counter()
                 _send_shm_path(sock, shm_path)
@@ -221,12 +268,14 @@ def run_sender(
             layer_elapsed = time.perf_counter() - t0
             logger.info(
                 "Layer %d/%d shm sent in %.2f ms (%.2f MB/s). "
-                "Gather: %.2f ms, Copy: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
+                "Gather: %.2f ms, Pin: %.2f ms, Copy: %.2f ms, "
+                "Send: %.2f ms, Ack: %.2f ms.",
                 hdr.layer_idx,
                 hdr.num_layers - 1,
                 layer_elapsed * 1000,
                 hdr.tensor_size / (1024**2) / layer_elapsed if layer_elapsed > 0 else 0,
                 gather_elapsed * 1000,
+                pin_elapsed * 1000,
                 copy_elapsed * 1000,
                 send_elapsed * 1000,
                 ack_elapsed * 1000,
