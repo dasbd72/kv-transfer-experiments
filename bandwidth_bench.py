@@ -1,19 +1,22 @@
-"""Benchmark PCIe and memory-copy bandwidth.
+"""Benchmark PCIe, memory-copy, and Unix socket bandwidth.
 
 Tests:
   1. PCIe Host-to-Device (H2D) — pinned and pageable CPU memory → GPU
   2. PCIe Device-to-Host (D2H) — GPU → pinned and pageable CPU memory
   3. Device-to-Device (D2D)    — GPU global memory copy
   4. Host-to-Host (H2H)        — CPU memory copy
+  5. Socket (UDS)              — stream send/receive over socketpair()
 
 Each test runs over a configurable range of buffer sizes with warmup
 iterations and reports throughput in GB/s.  GPU-involved transfers are
-timed with CUDA events for precision; CPU-only copies use
-time.perf_counter.
+timed with CUDA events for precision; CPU-only copies and socket I/O
+use time.perf_counter.
 """
 
 import argparse
 import logging
+import socket
+import threading
 import time
 from dataclasses import dataclass
 
@@ -143,6 +146,46 @@ def bench_h2h(
     return BenchResult("H2H (CPU)", size, elapsed, iters)
 
 
+def _recv_exact_sock(sock: socket.socket, n: int) -> None:
+    """Receive exactly *n* bytes from *sock* into the void (bandwidth sink)."""
+    remaining = n
+    while remaining:
+        chunk = sock.recv(min(remaining, 1024 * 1024))
+        if not chunk:
+            raise ConnectionError("Socket closed before all bytes received")
+        remaining -= len(chunk)
+
+
+def bench_socket_uds(
+    size: int,
+    iters: int,
+    warmup: int,
+) -> BenchResult:
+    """Unix domain stream socket: sender timed sendall, peer recv in a thread."""
+    payload = bytes(size)
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    def receiver() -> None:
+        for _ in range(warmup + iters):
+            _recv_exact_sock(b, size)
+
+    t = threading.Thread(target=receiver)
+    t.start()
+    try:
+        for _ in range(warmup):
+            a.sendall(payload)
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            a.sendall(payload)
+        elapsed = time.perf_counter() - t0
+    finally:
+        a.close()
+        t.join()
+        b.close()
+
+    return BenchResult("Socket (UDS)", size, elapsed, iters)
+
+
 # -- size schedule ------------------------------------------------------------
 
 DEFAULT_SIZES_MB = [1, 4, 16, 64, 256, 512, 1024]
@@ -219,12 +262,27 @@ def run_memcpy_bench(
     _print_table(results, logger)
 
 
+def run_socket_bench(
+    sizes: list[int],
+    iters: int,
+    warmup: int,
+    logger: logging.Logger,
+):
+    results: list[BenchResult] = []
+    for size in sizes:
+        results.append(bench_socket_uds(size, iters, warmup))
+
+    logger.info("")
+    logger.info("=== Socket Bandwidth (Unix domain stream) ===")
+    _print_table(results, logger)
+
+
 # -- CLI -----------------------------------------------------------------------
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark PCIe and memory-copy bandwidth.",
+        description="Benchmark PCIe, memory-copy, and Unix socket bandwidth.",
     )
     parser.add_argument(
         "--sizes",
@@ -251,9 +309,10 @@ def main():
     )
     parser.add_argument(
         "--test",
-        choices=["all", "pcie", "memcpy"],
+        choices=["all", "pcie", "memcpy", "socket"],
         default="all",
-        help="Which benchmark suite to run (default: %(default)s).",
+        help="Which benchmark suite to run: pcie and memcpy need CUDA; "
+        "socket is CPU-only (default: %(default)s).",
     )
     args = parser.parse_args()
 
@@ -263,16 +322,18 @@ def main():
     )
     logger = logging.getLogger("bandwidth_bench")
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for bandwidth benchmarks")
+    needs_cuda = args.test in ("all", "pcie", "memcpy")
+    if needs_cuda and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for PCIe and memcpy benchmarks")
 
-    device = torch.device(f"cuda:{args.device}")
-    torch.cuda.set_device(device)
     sizes = _parse_sizes(args.sizes)
-
-    gpu_name = torch.cuda.get_device_name(device)
-    gpu_mem = torch.cuda.get_device_properties(device).total_memory
-    logger.info("GPU %d: %s (%.1f GB)", args.device, gpu_name, gpu_mem / GB)
+    device: torch.device | None = None
+    if needs_cuda:
+        device = torch.device(f"cuda:{args.device}")
+        torch.cuda.set_device(device)
+        gpu_name = torch.cuda.get_device_name(device)
+        gpu_mem = torch.cuda.get_device_properties(device).total_memory
+        logger.info("GPU %d: %s (%.1f GB)", args.device, gpu_name, gpu_mem / GB)
     logger.info(
         "Sizes (MB): %s | iters=%d warmup=%d",
         [s // MB for s in sizes],
@@ -280,11 +341,14 @@ def main():
         args.warmup,
     )
 
-    if args.test in ("all", "pcie"):
+    if args.test in ("all", "pcie") and device is not None:
         run_pcie_bench(sizes, args.iters, args.warmup, device, logger)
 
-    if args.test in ("all", "memcpy"):
+    if args.test in ("all", "memcpy") and device is not None:
         run_memcpy_bench(sizes, args.iters, args.warmup, device, logger)
+
+    if args.test in ("all", "socket"):
+        run_socket_bench(sizes, args.iters, args.warmup, logger)
 
 
 if __name__ == "__main__":
