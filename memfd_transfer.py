@@ -279,7 +279,7 @@ def run_receiver(socket_path: str):
         with conn:
             executor = ThreadPoolExecutor(max_workers=4)
             futures: list[tuple[int, Future]] = []
-            transfer_start: float | None = None
+            transfer_start = time.perf_counter()
             num_layers: int | None = None
             total_bytes = 0
 
@@ -291,17 +291,8 @@ def run_receiver(socket_path: str):
                 mm = mmap.mmap(fd, file_size)
                 hdr = Header.read_from(mm)
 
-                if transfer_start is None:
-                    transfer_start = time.perf_counter()
+                if num_layers is None:
                     num_layers = hdr.num_layers
-                    logger.info(
-                        "Transfer started: %d layers, %d targets, "
-                        "seq_len=%d, per-layer payload=%.2f MB.",
-                        num_layers,
-                        hdr.num_targets,
-                        hdr.seq_len,
-                        hdr.tensor_size / (1024**2),
-                    )
 
                 total_bytes += hdr.tensor_size
 
@@ -316,13 +307,7 @@ def run_receiver(socket_path: str):
                     break
 
             recv_elapsed = time.perf_counter() - transfer_start
-            logger.info(
-                "All %d layers ACKed in %.2f s (%.2f MB, %.2f MB/s).",
-                num_layers,
-                recv_elapsed,
-                total_bytes / (1024**2),
-                total_bytes / (1024**2) / recv_elapsed if recv_elapsed > 0 else 0,
-            )
+            logger.info("All %d layers ACKed in %.2f s.", num_layers, recv_elapsed)
 
             results: dict[int, torch.Tensor] = {}
             keepalives: list[mmap.mmap] = []
@@ -335,10 +320,11 @@ def run_receiver(socket_path: str):
 
             total_elapsed = time.perf_counter() - transfer_start
             logger.info(
-                "Background processing complete. Total wall time: %.2f s. "
-                "Received %d layer tensors.",
-                total_elapsed,
+                "Background processing complete. Received %d layer tensors. "
+                "Total wall time: %.2f s (%.2f MB/s).",
                 len(results),
+                total_elapsed,
+                total_bytes / (1024**2) / total_elapsed if total_elapsed > 0 else 0,
             )
 
             # Release tensor views, then close mmap backings
