@@ -26,4 +26,4 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Copy the rest of the application code
 WORKDIR /app
 
-COPY header.py kv_layout.py memfd_transfer.py socket_transfer.py cuda_ipc_transfer.py ./
+COPY header.py kv_layout.py shm_transfer.py memfd_transfer.py socket_transfer.py cuda_ipc_transfer.py ./
