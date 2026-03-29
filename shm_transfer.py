@@ -4,10 +4,10 @@ Sender:
   1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
      populates it with multiple requests.
   2. For each layer, gathers the target requests' KV on the GPU, creates
-     a sized file under /dev/shm, mmap's it, pins the payload region
-     (cudaHostRegister under the hood via torch pin_memory), and performs
-     a single synchronous D2H copy into the pinned mmap.  No separate
-     pinned staging buffer or host-to-host copy.
+     a sized file under /dev/shm, mmap's it, and performs a single
+     synchronous D2H copy directly into the mmap payload (pageable host
+     memory backing the mapping).  No separate staging buffer or
+     host-to-host copy.
   3. Sends the absolute shm path (length-prefixed) and waits for a
      lightweight ACK before unlinking the file and proceeding to the
      next layer.
@@ -186,34 +186,29 @@ def run_sender(
             try:
                 os.ftruncate(fd, file_size)
                 mm = mmap.mmap(fd, file_size)
-
-                # Pin mmap region
-                t1 = time.perf_counter()
                 buffer = torch.frombuffer(
                     mm,
                     dtype=dtype,
                     offset=hdr_size,
                     count=export_numel,
-                ).pin_memory()
-                pin_elapsed = time.perf_counter() - t1
+                )
 
-                # Then single D2H: GPU gathered → pinned mmap payload
-                t2 = time.perf_counter()
+                t1 = time.perf_counter()
                 mm[0:hdr_size] = hdr.to_bytes()
                 buffer.copy_(gathered.view(-1))
-                copy_elapsed = time.perf_counter() - t2
+                copy_elapsed = time.perf_counter() - t1
+
+                t2 = time.perf_counter()
+                _send_shm_path(sock, shm_path)
+                send_elapsed = time.perf_counter() - t2
 
                 t3 = time.perf_counter()
-                _send_shm_path(sock, shm_path)
-                send_elapsed = time.perf_counter() - t3
-
-                t4 = time.perf_counter()
                 ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
                 if ack_layer != hdr.layer_idx:
                     raise RuntimeError(
                         f"ACK mismatch: expected {hdr.layer_idx}, got {ack_layer}"
                     )
-                ack_elapsed = time.perf_counter() - t4
+                ack_elapsed = time.perf_counter() - t3
 
                 mm.close()
             finally:
@@ -226,14 +221,13 @@ def run_sender(
             layer_elapsed = time.perf_counter() - t0
             logger.info(
                 "Layer %d/%d shm sent in %.2f ms (%.2f MB/s). "
-                "Gather: %.2f ms, Copy: %.2f ms, Pin: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
+                "Gather: %.2f ms, Copy: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
                 hdr.layer_idx,
                 hdr.num_layers - 1,
                 layer_elapsed * 1000,
                 hdr.tensor_size / (1024**2) / layer_elapsed if layer_elapsed > 0 else 0,
                 gather_elapsed * 1000,
                 copy_elapsed * 1000,
-                pin_elapsed * 1000,
                 send_elapsed * 1000,
                 ack_elapsed * 1000,
             )
