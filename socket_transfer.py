@@ -231,11 +231,12 @@ def _process_layer(
         hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim
     )
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    elapsed = time.perf_counter() - t0
     logger.info(
-        "Layer %d background done in %.1f ms → %s %s",
+        "Layer %d background done in %.1f ms (%.2f MB/s) → %s %s",
         hdr.layer_idx,
-        elapsed_ms,
+        elapsed * 1000,
+        hdr.tensor_size / (1024**2) / elapsed if elapsed > 0 else 0,
         tensor.shape,
         tensor.dtype,
     )
