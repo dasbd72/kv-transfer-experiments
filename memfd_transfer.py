@@ -1,104 +1,390 @@
-"""IPC transfer of a KV Cache tensor between a sender and a receiver."""
+"""Layer-wise IPC transfer of GPU-resident paged KV cache via memfd.
+
+Sender:
+  1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
+     populates it with multiple requests.
+  2. For each layer, gathers only the target requests' KV into a contiguous
+     export tensor, copies to pinned CPU memory (async D2H with double
+     buffering), writes to a memfd, and sends the fd.
+  3. Waits only for a lightweight ACK ("fd opened") before proceeding.
+
+Receiver:
+  1. Parses the header, sends ACK immediately.
+  2. Enqueues background work to copy the mmap payload into a contiguous
+     CPU torch.Tensor via zero-copy torch.frombuffer + clone.
+
+Wire layout per layer (after v3 header):
+  Contiguous tensor of shape (num_targets, seq_len, 2, num_kv_heads, head_dim)
+  in the model's native dtype.
+"""
 
 import argparse
-import os
-import mmap
-import socket
-import time
+import ctypes
 import logging
-from header import Header
+import mmap
+import os
+import socket
+import struct
+import time
+import random
+from concurrent.futures import Future, ThreadPoolExecutor
+
+import torch
+
+from header import DTYPE_ID, ID_TO_DTYPE_NAME, Header
+from kv_layout import (
+    DTYPE_BYTES,
+    TORCH_DTYPE,
+    KVProfile,
+    PagedKVPool,
+    allocate_requests,
+    gather_kv,
+    load_kv_profile,
+)
+
+ACK_SIZE = 5  # b"A" + big-endian uint32 layer index
 
 
-def run_sender(socket_path, tensor_size):
+# -- ACK helpers --------------------------------------------------------------
+
+
+def _pack_ack(layer_idx: int) -> bytes:
+    return b"A" + struct.pack(">I", layer_idx)
+
+
+def _unpack_ack(data: bytes) -> int:
+    if len(data) != ACK_SIZE or data[0:1] != b"A":
+        raise ValueError(f"Invalid ACK payload: {data!r}")
+    return struct.unpack(">I", data[1:5])[0]
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Receive exactly *n* bytes from *sock*."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Socket closed before all bytes received")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+# -- memfd I/O helpers --------------------------------------------------------
+
+
+def _write_tensor_bytes(fd: int, tensor: torch.Tensor, nbytes: int) -> None:
+    """Write entire buffer to *fd*, handling short writes."""
+    raw = (ctypes.c_byte * nbytes).from_address(tensor.data_ptr())
+    os.write(fd, raw)
+
+
+def _send_memfd(
+    pinned: torch.Tensor,
+    hdr: Header,
+    sock: socket.socket,
+    logger: logging.Logger,
+):
+    """Create a memfd, write header + tensor payload via write(), and send the fd."""
+    assert pinned.is_contiguous(), "pinned staging buffer must be contiguous"
+
+    hdr_bytes = hdr.to_bytes()
+    fd = os.memfd_create(f"kv_layer_{hdr.layer_idx}")
+
+    t0 = time.perf_counter()
+    os.write(fd, hdr_bytes)
+    _write_tensor_bytes(fd, pinned, hdr.tensor_size)
+    write_elapsed = time.perf_counter() - t0
+
+    socket.send_fds(sock, [b"1"], [fd])
+    logger.info(
+        "Layer %d/%d memfd sent (%.2f MB, write %.1f ms, %.2f MB/s).",
+        hdr.layer_idx,
+        hdr.num_layers - 1,
+        hdr.tensor_size / (1024**2),
+        write_elapsed * 1000,
+        hdr.tensor_size / (1024**2) / write_elapsed if write_elapsed > 0 else 0,
+    )
+    os.close(fd)
+
+
+# -- sender -------------------------------------------------------------------
+
+
+def run_sender(
+    socket_path: str,
+    profile: KVProfile,
+    num_requests: int,
+    seq_len: int,
+    num_gpu_blocks: int,
+    block_size: int,
+    target_indices: list[int],
+):
     logger = logging.getLogger("sender")
 
-    header = Header(tensor_size=tensor_size)
-    file_size = header.SIZE + tensor_size
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for sender (real GPU KV cache)")
 
-    # 1. Create anonymous file in RAM
-    fd = os.memfd_create("kv_cache_tensor")
-    os.ftruncate(fd, file_size)
+    device = torch.device("cuda")
 
-    # 2. Write dummy "KV Cache" data into memory
-    start_write_pc = time.perf_counter()
-    with mmap.mmap(fd, file_size) as mm:
-        header_bytes = header.to_bytes()
-        k_data = b"K" * (tensor_size // 2)
-        v_data = b"V" * (tensor_size - (tensor_size // 2))
-        payload = header_bytes + k_data + v_data
-        mm.write(payload)
-        logger.info(
-            "Data prepared in %.2f seconds.",
-            time.perf_counter() - start_write_pc,
-        )
+    # 1. Allocate paged KV pool and block tables
+    pool = PagedKVPool(profile, num_gpu_blocks, block_size, device)
+    block_tables = allocate_requests(pool, num_requests, seq_len)
 
-    # 3. Connect to UDS and send the File Descriptor
-    logger.info("Connecting to socket at %s...", socket_path)
+    logger.info(
+        "Model %s: layers=%d kv_heads=%d head_dim=%d dtype=%s",
+        profile.model_id,
+        pool.num_layers,
+        pool.num_kv_heads,
+        pool.head_dim,
+        profile.dtype_name,
+    )
+    logger.info(
+        "GPU pool: %d blocks × block_size=%d, num_requests=%d × seq_len=%d",
+        num_gpu_blocks,
+        block_size,
+        num_requests,
+        seq_len,
+    )
+
+    num_targets = len(target_indices)
+    dtype = profile.torch_dtype
+    export_numel = num_targets * seq_len * 2 * pool.num_kv_heads * pool.head_dim
+    export_bytes = export_numel * profile.dtype_bytes
+
+    logger.info(
+        "Exporting %d/%d requests (indices %s), per-layer payload=%.2f MB",
+        num_targets,
+        num_requests,
+        target_indices,
+        export_bytes / (1024**2),
+    )
+
+    # 2. Double-buffered pinned CPU staging + CUDA stream
+    pinned = [torch.empty(export_numel, dtype=dtype).pin_memory() for _ in range(2)]
+    stream = torch.cuda.Stream()
+
+    # 3. Connect and transfer
+    logger.info("Connecting to %s ...", socket_path)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        # Wait for receiver to bind the socket
         while True:
             try:
                 sock.connect(socket_path)
                 break
-            except FileNotFoundError:
+            except (FileNotFoundError, ConnectionRefusedError):
                 time.sleep(0.5)
 
-        # Send the FD. A dummy byte [b'1'] is required by the protocol.
-        socket.send_fds(sock, [b"1"], [fd])
-        logger.info("File descriptor sent. Waiting for receiver acknowledgment...")
+        transfer_start = time.perf_counter()
+        prev_hdr: Header | None = None
+        buf_idx = 0
 
-        done = sock.recv(1)
-        if done == b"D":
-            logger.info("Receiver acknowledged. Terminating sender...")
-        else:
-            logger.error("Unexpected receiver signal: %r", done)
+        for layer_idx in range(pool.num_layers):
+            # Gather target requests on GPU
+            gathered = gather_kv(
+                pool.kv_caches[layer_idx],
+                block_tables,
+                target_indices,
+                seq_len,
+            )
 
+            # Async D2H into current pinned buffer
+            with torch.cuda.stream(stream):
+                pinned[buf_idx].copy_(gathered.view(-1), non_blocking=True)
+
+            # Overlap: send previous layer's memfd while D2H runs
+            if prev_hdr is not None:
+                _send_memfd(pinned[1 - buf_idx], prev_hdr, sock, logger)
+                ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
+                if ack_layer != prev_hdr.layer_idx:
+                    raise RuntimeError(
+                        f"ACK mismatch: expected {prev_hdr.layer_idx}, got {ack_layer}"
+                    )
+
+            # Wait for D2H to finish
+            stream.synchronize()
+
+            prev_hdr = Header(
+                layer_idx=layer_idx,
+                num_layers=pool.num_layers,
+                tensor_size=export_bytes,
+                block_size=block_size,
+                num_kv_heads=pool.num_kv_heads,
+                head_dim=pool.head_dim,
+                dtype_id=DTYPE_ID[profile.dtype_name],
+                seq_len=seq_len,
+                num_targets=num_targets,
+                target_indices=tuple(target_indices),
+            )
+            buf_idx = 1 - buf_idx
+
+        # Flush last layer
+        if prev_hdr is not None:
+            _send_memfd(pinned[1 - buf_idx], prev_hdr, sock, logger)
+            ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
+            if ack_layer != prev_hdr.layer_idx:
+                raise RuntimeError(
+                    f"ACK mismatch: expected {prev_hdr.layer_idx}, got {ack_layer}"
+                )
+
+        elapsed = time.perf_counter() - transfer_start
+        total_bytes = pool.num_layers * export_bytes
+        logger.info(
+            "All %d layers sent in %.2f s (%.2f MB, %.2f MB/s).",
+            pool.num_layers,
+            elapsed,
+            total_bytes / (1024**2),
+            total_bytes / (1024**2) / elapsed if elapsed > 0 else 0,
+        )
+
+
+# -- receiver -----------------------------------------------------------------
+
+
+def _process_layer(
+    fd: int,
+    mm: mmap.mmap,
+    hdr: Header,
+    logger: logging.Logger,
+) -> torch.Tensor:
+    """Background: build a contiguous CPU tensor from the mmap payload."""
+    t0 = time.perf_counter()
+
+    dtype_name = ID_TO_DTYPE_NAME[hdr.dtype_id]
+    dtype = TORCH_DTYPE[dtype_name]
+    num_elements = hdr.tensor_size // DTYPE_BYTES[dtype_name]
+
+    # Zero-copy view of mmap → clone to own the memory
+    tensor = (
+        torch.frombuffer(
+            mm, dtype=dtype, offset=hdr.total_header_size, count=num_elements
+        )
+        .clone()
+        .reshape(hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
+    )
+
+    mm.close()
     os.close(fd)
 
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "Layer %d background done in %.1f ms → %s %s",
+        hdr.layer_idx,
+        elapsed_ms,
+        tensor.shape,
+        tensor.dtype,
+    )
+    return tensor
 
-def run_receiver(socket_path):
+
+def run_receiver(socket_path: str):
     logger = logging.getLogger("receiver")
 
-    # 1. Setup the Unix Domain Socket
     if os.path.exists(socket_path):
         os.remove(socket_path)
 
-    logger.info("Listening on %s...", socket_path)
+    logger.info("Listening on %s ...", socket_path)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         server.bind(socket_path)
         server.listen(1)
 
-        conn, addr = server.accept()
+        conn, _ = server.accept()
         with conn:
-            # 2. Receive the File Descriptor
-            msg, fds, flags, addr = socket.recv_fds(conn, 1, 1)
-            received_fd = fds[0]
-            file_size = os.fstat(received_fd).st_size
-            logger.info("Received file descriptor: %d", received_fd)
-            logger.info("File size (bytes): %d", file_size)
+            executor = ThreadPoolExecutor(max_workers=4)
+            futures: list[tuple[int, Future]] = []
+            transfer_start: float | None = None
+            num_layers: int | None = None
+            total_bytes = 0
 
-            # 3. Zero-copy read from the shared memory
-            with mmap.mmap(received_fd, file_size) as mm:
-                conn.sendall(b"D")
-                header = Header.from_bytes(mm.read(Header.SIZE))
-                data = mm.read(header.tensor_size)
-            if len(data) != header.tensor_size:
-                logger.error("Incomplete data transfer.")
-                return
+            while True:
+                _, fds, _, _ = socket.recv_fds(conn, 1, 1)
+                fd = fds[0]
+                file_size = os.fstat(fd).st_size
+
+                mm = mmap.mmap(fd, file_size)
+                hdr = Header.read_from(mm)
+
+                if transfer_start is None:
+                    transfer_start = time.perf_counter()
+                    num_layers = hdr.num_layers
+                    logger.info(
+                        "Transfer started: %d layers, %d targets, "
+                        "seq_len=%d, per-layer payload=%.2f MB.",
+                        num_layers,
+                        hdr.num_targets,
+                        hdr.seq_len,
+                        hdr.tensor_size / (1024**2),
+                    )
+
+                total_bytes += hdr.tensor_size
+
+                # ACK immediately — sender can proceed
+                conn.sendall(_pack_ack(hdr.layer_idx))
+
+                # Enqueue background tensor construction
+                fut = executor.submit(_process_layer, fd, mm, hdr, logger)
+                futures.append((hdr.layer_idx, fut))
+
+                if hdr.layer_idx == num_layers - 1:
+                    break
+
+            recv_elapsed = time.perf_counter() - transfer_start
             logger.info(
-                "Completed reading %d bytes in %.2f seconds.",
-                header.tensor_size,
-                time.time() - (header.timestamp / 1000),
+                "All %d layers ACKed in %.2f s (%.2f MB, %.2f MB/s).",
+                num_layers,
+                recv_elapsed,
+                total_bytes / (1024**2),
+                total_bytes / (1024**2) / recv_elapsed if recv_elapsed > 0 else 0,
+            )
+
+            results: dict[int, torch.Tensor] = {}
+            for layer_idx, fut in futures:
+                results[layer_idx] = fut.result()
+            executor.shutdown()
+
+            total_elapsed = time.perf_counter() - transfer_start
+            logger.info(
+                "Background processing complete. Total wall time: %.2f s. "
+                "Received %d layer tensors.",
+                total_elapsed,
+                len(results),
             )
 
 
+# -- CLI -----------------------------------------------------------------------
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Layer-wise paged KV cache transfer via memfd over Unix domain sockets.",
+    )
     role_group = parser.add_mutually_exclusive_group(required=True)
     role_group.add_argument("--sender", action="store_true")
     role_group.add_argument("--receiver", action="store_true")
-    parser.add_argument("--socket-path", type=str, default="/tmp/memfd.sock")
-    parser.add_argument("--tensor-size", type=int, default=100 * 1024 * 1024)
+    parser.add_argument("--socket-path", default="/tmp/memfd.sock")
+    parser.add_argument(
+        "--model",
+        default="meta-llama/Llama-3.1-8B",
+        help="HuggingFace model id (sender only).",
+    )
+    parser.add_argument("--num-requests", type=int, default=16)
+    parser.add_argument("--seq-len", type=int, default=2048)
+    parser.add_argument(
+        "--num-gpu-blocks",
+        type=int,
+        default=0,
+        help="Total GPU KV blocks (0 = auto-size for num_requests × seq_len).",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=16,
+        help="Tokens per KV block (must be a multiple of 16).",
+    )
+    parser.add_argument(
+        "--target-count",
+        type=int,
+        default=0,
+        help="Export target_count requests (0 = all).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -107,7 +393,21 @@ def main():
     )
 
     if args.sender:
-        run_sender(args.socket_path, args.tensor_size)
+        profile = load_kv_profile(args.model)
+
+        blocks_per_req = (args.seq_len + args.block_size - 1) // args.block_size
+        num_gpu_blocks = args.num_gpu_blocks or args.num_requests * blocks_per_req
+        target_indices = random.sample(range(args.num_requests), args.target_count)
+
+        run_sender(
+            args.socket_path,
+            profile,
+            args.num_requests,
+            args.seq_len,
+            num_gpu_blocks,
+            args.block_size,
+            target_indices,
+        )
     else:
         run_receiver(args.socket_path)
 
