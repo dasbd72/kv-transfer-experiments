@@ -322,7 +322,7 @@ def _process_layer(
     deserialize_elapsed = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    tensor = torch.empty(expected_shape, dtype=ipc_tensor.dtype).pin_memory()
+    tensor = torch.empty(expected_shape, dtype=ipc_tensor.dtype, pin_memory=True)
     pin_elapsed = time.perf_counter() - t1
 
     t2 = time.perf_counter()
