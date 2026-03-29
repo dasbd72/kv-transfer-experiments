@@ -323,13 +323,16 @@ def _process_layer(
 
     t1 = time.perf_counter()
     tensor = torch.empty(expected_shape, dtype=ipc_tensor.dtype).pin_memory()
+    pin_elapsed = time.perf_counter() - t1
+
+    t2 = time.perf_counter()
     tensor.copy_(ipc_tensor)
-    copy_elapsed = time.perf_counter() - t1
+    d2h_elapsed = time.perf_counter() - t2
 
     elapsed = time.perf_counter() - t0
     logger.info(
         "Layer %d background done in %.1f ms (%.2f MB/s) → %s %s (device=%s). "
-        "Deserialize: %.2f ms, Copy: %.2f ms.",
+        "Deserialize: %.2f ms, Pin: %.2f ms, D2H: %.2f ms.",
         hdr.layer_idx,
         elapsed * 1000,
         hdr.tensor_size / (1024**2) / elapsed if elapsed > 0 else 0,
@@ -337,7 +340,8 @@ def _process_layer(
         tensor.dtype,
         tensor.device,
         deserialize_elapsed * 1000,
-        copy_elapsed * 1000,
+        pin_elapsed * 1000,
+        d2h_elapsed * 1000,
     )
     return tensor
 
