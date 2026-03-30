@@ -129,8 +129,13 @@ class PagedKVPool:
         for _ in range(self.num_layers):
             self.kv_caches.append(
                 torch.randn(
-                    2, num_blocks, block_size, self.num_kv_heads, self.head_dim,
-                    dtype=self.dtype, device=self.device,
+                    2,
+                    num_blocks,
+                    block_size,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    dtype=self.dtype,
+                    device=self.device,
                 )
             )
 
@@ -148,7 +153,9 @@ class PagedKVPool:
 
 
 def allocate_requests(
-    pool: PagedKVPool, num_requests: int, seq_len: int,
+    pool: PagedKVPool,
+    num_requests: int,
+    seq_len: int,
 ) -> torch.Tensor:
     """Allocate blocks for *num_requests* and return the block table.
 
