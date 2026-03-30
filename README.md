@@ -75,20 +75,5 @@ docker run -it --rm \
 python cuda_ipc_transfer.py --receiver --socket-path /tmp/shared_sock/cuda_ipc.sock
 python cuda_ipc_transfer.py --sender --socket-path /tmp/shared_sock/cuda_ipc.sock --model /home/models/Qwen3-0.6B --num-requests 32 --seq-len 2048 --target-count 16
 
-# CUDA IPC requires both containers to share the host IPC namespace (--ipc=host)
-# and both must have GPU access.  The receiver gets GPU tensors directly — no D2H/H2D copy.
-docker run -it --rm \
-  -v /tmp/shared_sock:/tmp/shared_sock \
-  --gpus 1 \
-  --ipc=host \
-  dasbd72/experiment-kv-transfer \
-  bash -c "python3 cuda_ipc_transfer.py --receiver --socket-path /tmp/shared_sock/cuda_ipc.sock"
-
-docker run -it --rm \
-  -v /home/models:/models \
-  -v /tmp/shared_sock:/tmp/shared_sock \
-  --gpus 1 \
-  --ipc=host \
-  dasbd72/experiment-kv-transfer \
-  bash -c "python3 cuda_ipc_transfer.py --sender --socket-path /tmp/shared_sock/cuda_ipc.sock --model /models/Qwen3-0.6B --num-requests 32 --seq-len 2048 --target-count 16"
+# Cuda IPC does not work in docker unless GPU of sender is visible to the receiver.
 ```
