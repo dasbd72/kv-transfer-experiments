@@ -3,11 +3,10 @@
 Sender:
   1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
      populates it with multiple requests.
-  2. For each layer, gathers the target requests' KV on the GPU, creates
-     a sized file under /dev/shm (size rounded up to a host page), mmap's
-     it, registers the mapping with cudaHostRegister so the buffer is
-     pinned for CUDA, then performs a synchronous D2H copy into the
-     payload.  No separate staging buffer or host-to-host copy.
+  2. For each layer, creates a sized file under /dev/shm (size rounded up
+     to a host page), mmap's it, registers the mapping with cudaHostRegister,
+     then runs :func:`gather_kv_into_cpu` (CUDA gather + D2H into the mmap
+     payload).  No advanced-index :func:`gather_kv` path.
   3. Sends the absolute shm path (length-prefixed) and waits for a
      lightweight ACK before unlinking the file and proceeding to the
      next layer.
@@ -33,7 +32,6 @@ import socket
 import struct
 import time
 import random
-from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 
@@ -44,7 +42,7 @@ from kv_layout import (
     KVProfile,
     PagedKVPool,
     allocate_requests,
-    gather_kv,
+    gather_kv_into_cpu,
     load_kv_profile,
 )
 
@@ -54,9 +52,18 @@ PATH_LEN_SIZE = 4  # big-endian uint32 path byte length
 # cudaHostRegisterPortable — same flag as torch.cuda._pin_memory_utils.pin_memory
 _CUDA_HOST_REGISTER_PORTABLE = 1
 
+# Payload must be 16-byte aligned so gather_kv_cuda.cu can use the vectorized
+# (uint4) path.  mmap bases are always page-aligned, so aligning the *offset*
+# of the payload within the file is sufficient.
+_PAYLOAD_ALIGN = 16  # sizeof(uint4)
+
+
+def _round_up(nbytes: int, align: int) -> int:
+    return (nbytes + align - 1) // align * align
+
 
 def _round_up_page(nbytes: int, page: int) -> int:
-    return (nbytes + page - 1) // page * page
+    return _round_up(nbytes, page)
 
 
 def _cuda_host_register(ptr: int, nbytes: int) -> None:
@@ -91,14 +98,22 @@ def _unpack_ack(data: bytes) -> int:
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    """Receive exactly *n* bytes from *sock*."""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Socket closed before all bytes received")
-        buf.extend(chunk)
+    """Receive exactly *n* bytes from *sock* (small reads; prefer recv_into for large)."""
+    buf = bytearray(n)
+    _recv_exact_into(sock, buf)
     return bytes(buf)
+
+
+def _recv_exact_into(sock: socket.socket, buf: bytearray) -> None:
+    """Fill *buf* exactly from *sock* using recv_into (no incremental realloc)."""
+    mv = memoryview(buf)
+    pos = 0
+    n = len(buf)
+    while pos < n:
+        got = sock.recv_into(mv[pos:])
+        if got == 0:
+            raise ConnectionError("Socket closed before all bytes received")
+        pos += got
 
 
 def _send_shm_path(sock: socket.socket, path: str) -> None:
@@ -177,7 +192,8 @@ def run_sender(
         target_indices=tuple(target_indices),
     )
     hdr_size = Header(layer_idx=0, **hdr_kwargs).total_header_size
-    file_size = hdr_size + export_bytes
+    payload_offset = _round_up(hdr_size, _PAYLOAD_ALIGN)
+    file_size = payload_offset + export_bytes
     page = os.sysconf("SC_PAGE_SIZE")
     map_size = _round_up_page(file_size, page)
 
@@ -192,18 +208,10 @@ def run_sender(
                 time.sleep(0.5)
 
         transfer_start = time.perf_counter()
+        mmap_objects: list[mmap.mmap] = []
 
         for layer_idx in range(pool.num_layers):
             t0 = time.perf_counter()
-            gathered = gather_kv(
-                pool.kv_caches[layer_idx],
-                block_tables,
-                target_indices,
-                seq_len,
-            )
-            torch.cuda.synchronize()
-            gather_elapsed = time.perf_counter() - t0
-
             hdr = Header(layer_idx=layer_idx, **hdr_kwargs)
 
             token = secrets.token_hex(8)
@@ -217,27 +225,41 @@ def run_sender(
                 mm = mmap.mmap(fd, map_size)
                 whole = (ctypes.c_byte * map_size).from_buffer(mm, 0)
                 base_ptr = ctypes.addressof(whole)
+                mmap_objects.append(mm)
 
                 t_register = time.perf_counter()
                 _cuda_host_register(base_ptr, map_size)
                 register_elapsed = time.perf_counter() - t_register
 
-                buffer = torch.frombuffer(
+                out = torch.frombuffer(
                     mm,
                     dtype=dtype,
-                    offset=hdr_size,
+                    offset=payload_offset,
                     count=export_numel,
+                ).reshape(
+                    num_targets,
+                    seq_len,
+                    2,
+                    pool.num_kv_heads,
+                    pool.head_dim,
                 )
 
-                t1 = time.perf_counter()
                 mm[0:hdr_size] = hdr.to_bytes()
-                buffer.copy_(gathered.view(-1))
-                copy_elapsed = time.perf_counter() - t1
 
-                # Drop buffer/ctypes views before mm.close(): mmap refuses to
+                t_gather = time.perf_counter()
+                gather_kv_into_cpu(
+                    pool.kv_caches[layer_idx],
+                    block_tables,
+                    target_indices,
+                    seq_len,
+                    out,
+                )
+                torch.cuda.synchronize()
+                gather_elapsed = time.perf_counter() - t_gather
+
+                # Drop tensor/ctypes views before mm.close(): mmap refuses to
                 # close while buffer exports (frombuffer / from_buffer) exist.
-                if buffer is not None:
-                    del buffer
+                del out
                 del whole
                 t_unregister = time.perf_counter()
                 _cuda_host_unregister(base_ptr)
@@ -256,8 +278,6 @@ def run_sender(
                         f"ACK mismatch: expected {hdr.layer_idx}, got {ack_layer}"
                     )
                 ack_elapsed = time.perf_counter() - t3
-
-                mm.close()
             finally:
                 os.close(fd)
                 try:
@@ -268,7 +288,7 @@ def run_sender(
             layer_elapsed = time.perf_counter() - t0
             logger.info(
                 "Layer %d/%d shm sent in %.2f ms (%.2f MB/s). "
-                "Gather: %.2f ms, Pin: %.2f ms, Copy: %.2f ms, "
+                "Gather→CPU: %.2f ms, Pin: %.2f ms, "
                 "Send: %.2f ms, Ack: %.2f ms.",
                 hdr.layer_idx,
                 hdr.num_layers - 1,
@@ -276,9 +296,14 @@ def run_sender(
                 hdr.tensor_size / (1024**2) / layer_elapsed if layer_elapsed > 0 else 0,
                 gather_elapsed * 1000,
                 pin_elapsed * 1000,
-                copy_elapsed * 1000,
                 send_elapsed * 1000,
                 ack_elapsed * 1000,
+            )
+
+        ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
+        if ack_layer != pool.num_layers:
+            raise RuntimeError(
+                f"ACK mismatch: expected {pool.num_layers}, got {ack_layer}"
             )
 
         elapsed = time.perf_counter() - transfer_start
@@ -290,6 +315,9 @@ def run_sender(
             total_bytes / (1024**2),
             total_bytes / (1024**2) / elapsed if elapsed > 0 else 0,
         )
+
+        for mm in mmap_objects:
+            mm.close()
 
 
 # -- receiver -----------------------------------------------------------------
@@ -312,10 +340,11 @@ def _process_layer(
     dtype = TORCH_DTYPE[dtype_name]
     num_elements = hdr.tensor_size // DTYPE_BYTES[dtype_name]
 
+    payload_offset = _round_up(hdr.total_header_size, _PAYLOAD_ALIGN)
     tensor = torch.frombuffer(
         mm,
         dtype=dtype,
-        offset=hdr.total_header_size,
+        offset=payload_offset,
         count=num_elements,
     ).reshape(hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
 
@@ -346,8 +375,8 @@ def run_receiver(socket_path: str):
 
         conn, _ = server.accept()
         with conn:
-            executor = ThreadPoolExecutor(max_workers=4)
-            futures: list[tuple[int, Future]] = []
+            # ACK each layer quickly; build tensors after the receive loop.
+            pending: list[tuple[int, mmap.mmap, Header]] = []
             transfer_start = time.perf_counter()
             num_layers: int | None = None
             total_bytes = 0
@@ -368,9 +397,7 @@ def run_receiver(socket_path: str):
                 # ACK immediately — sender can proceed
                 conn.sendall(_pack_ack(hdr.layer_idx))
 
-                # Enqueue background tensor construction
-                fut = executor.submit(_process_layer, fd, mm, hdr, logger)
-                futures.append((hdr.layer_idx, fut))
+                pending.append((fd, mm, hdr))
 
                 if hdr.layer_idx == num_layers - 1:
                     break
@@ -380,12 +407,12 @@ def run_receiver(socket_path: str):
 
             results: dict[int, torch.Tensor] = {}
             keepalives: list[mmap.mmap] = []
-            for layer_idx, fut in futures:
-                tensor, mm = fut.result()
-                results[layer_idx] = tensor
-                keepalives.append(mm)
-            executor.shutdown()
-            futures.clear()
+            for fd, mm, hdr in pending:
+                tensor, mm_keep = _process_layer(fd, mm, hdr, logger)
+                results[hdr.layer_idx] = tensor
+                keepalives.append(mm_keep)
+
+            conn.sendall(_pack_ack(num_layers))
 
             total_elapsed = time.perf_counter() - transfer_start
             logger.info(

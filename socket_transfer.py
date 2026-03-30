@@ -3,9 +3,8 @@
 Sender:
   1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
      populates it with multiple requests.
-  2. For each layer, gathers the target requests' KV on the GPU, copies to a
-     pinned CPU buffer (synchronous D2H), then sends header + raw tensor bytes
-     over the socket.
+  2. For each layer, runs :func:`gather_kv_into_cpu` into a pinned CPU
+     buffer, then sends header + raw tensor bytes over the socket.
   3. Waits for a lightweight ACK before proceeding to the next layer.
 
 Receiver:
@@ -26,7 +25,6 @@ import socket
 import struct
 import time
 import random
-from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 
@@ -37,7 +35,7 @@ from kv_layout import (
     KVProfile,
     PagedKVPool,
     allocate_requests,
-    gather_kv,
+    gather_kv_into_cpu,
     load_kv_profile,
 )
 
@@ -141,7 +139,14 @@ def run_sender(
         target_indices=tuple(target_indices),
     )
 
-    pinned = torch.empty(export_numel, dtype=dtype).pin_memory()
+    t_pin = time.perf_counter()
+    pinned = torch.empty(
+        (num_targets, seq_len, 2, pool.num_kv_heads, pool.head_dim),
+        dtype=dtype,
+        pin_memory=True,
+    )
+    pin_elapsed = time.perf_counter() - t_pin
+    logger.info("Pin: %.2f ms", pin_elapsed * 1000)
 
     # 2. Connect and transfer
     logger.info("Connecting to %s ...", socket_path)
@@ -157,24 +162,22 @@ def run_sender(
 
         for layer_idx in range(pool.num_layers):
             t0 = time.perf_counter()
-            gathered = gather_kv(
+            gather_kv_into_cpu(
                 pool.kv_caches[layer_idx],
                 block_tables,
                 target_indices,
                 seq_len,
+                pinned,
             )
             torch.cuda.synchronize()
             gather_elapsed = time.perf_counter() - t0
 
             hdr = Header(layer_idx=layer_idx, **hdr_kwargs)
 
-            # Single synchronous D2H: GPU gathered → pinned buffer
-            t1 = time.perf_counter()
-            pinned.copy_(gathered.view(-1))
-            copy_elapsed = time.perf_counter() - t1
-
             t2 = time.perf_counter()
-            raw = (ctypes.c_byte * hdr.tensor_size).from_address(pinned.data_ptr())
+            raw = (ctypes.c_byte * hdr.tensor_size).from_address(
+                pinned.contiguous().data_ptr()
+            )
             sock.sendall(hdr.to_bytes())
             sock.sendall(raw)
             send_elapsed = time.perf_counter() - t2
@@ -190,15 +193,20 @@ def run_sender(
             layer_elapsed = time.perf_counter() - t0
             logger.info(
                 "Layer %d/%d socket sent in %.2f ms (%.2f MB/s). "
-                "Gather: %.2f ms, Copy: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
+                "Gather→CPU: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
                 hdr.layer_idx,
                 hdr.num_layers - 1,
                 layer_elapsed * 1000,
                 hdr.tensor_size / (1024**2) / layer_elapsed if layer_elapsed > 0 else 0,
                 gather_elapsed * 1000,
-                copy_elapsed * 1000,
                 send_elapsed * 1000,
                 ack_elapsed * 1000,
+            )
+
+        ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
+        if ack_layer != pool.num_layers:
+            raise RuntimeError(
+                f"ACK mismatch: expected {pool.num_layers}, got {ack_layer}"
             )
 
         elapsed = time.perf_counter() - transfer_start
@@ -220,7 +228,7 @@ def _process_layer(
     hdr: Header,
     logger: logging.Logger,
 ) -> torch.Tensor:
-    """Background: build a contiguous CPU tensor from the received payload."""
+    """Build a contiguous CPU tensor from the received payload."""
     t0 = time.perf_counter()
 
     dtype_name = ID_TO_DTYPE_NAME[hdr.dtype_id]
@@ -256,8 +264,8 @@ def run_receiver(socket_path: str):
 
         conn, _ = server.accept()
         with conn:
-            executor = ThreadPoolExecutor(max_workers=4)
-            futures: list[tuple[int, Future]] = []
+            # ACK each layer quickly; build tensors after the receive loop.
+            pending: list[tuple[bytearray, Header]] = []
             transfer_start = time.perf_counter()
             num_layers: int | None = None
             total_bytes = 0
@@ -282,9 +290,7 @@ def run_receiver(socket_path: str):
                 # ACK immediately — sender can proceed
                 conn.sendall(_pack_ack(hdr.layer_idx))
 
-                # Enqueue background tensor construction
-                fut = executor.submit(_process_layer, payload, hdr, logger)
-                futures.append((hdr.layer_idx, fut))
+                pending.append((payload, hdr))
 
                 if hdr.layer_idx == num_layers - 1:
                     break
@@ -293,10 +299,10 @@ def run_receiver(socket_path: str):
             logger.info("All %d layers ACKed in %.2f s.", num_layers, recv_elapsed)
 
             results: dict[int, torch.Tensor] = {}
-            for layer_idx, fut in futures:
-                results[layer_idx] = fut.result()
-            executor.shutdown()
-            futures.clear()
+            for payload, hdr in pending:
+                results[hdr.layer_idx] = _process_layer(payload, hdr, logger)
+
+            conn.sendall(_pack_ack(num_layers))
 
             total_elapsed = time.perf_counter() - transfer_start
             logger.info(

@@ -9,10 +9,49 @@ MLA / FP8 / other non-standard cache formats use a different formula and
 are NOT supported here; load_kv_profile() will raise for unsupported dtypes.
 """
 
+import os
 from dataclasses import dataclass
 
 import torch
 from transformers import AutoConfig
+
+# JIT CUDA extension for gather (avoids Triton kernel compile/cold start on each process).
+_gather_kv_cuda_mod: object | None = None
+_gather_kv_cuda_load_failed = False
+
+
+def _get_gather_kv_cuda():
+    """Load ``csrc/gather_kv*.`` once; return module or None if unavailable."""
+    global _gather_kv_cuda_mod, _gather_kv_cuda_load_failed
+    if _gather_kv_cuda_load_failed:
+        return None
+    if _gather_kv_cuda_mod is not None:
+        return _gather_kv_cuda_mod
+    try:
+        if not torch.cuda.is_available():
+            _gather_kv_cuda_load_failed = True
+            return None
+        from torch.utils.cpp_extension import load
+
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        _gather_kv_cuda_mod = load(
+            name="gather_kv_cuda",
+            sources=[
+                os.path.join(_dir, "csrc", "gather_kv.cpp"),
+                os.path.join(_dir, "csrc", "gather_kv_cuda.cu"),
+            ],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            verbose=False,
+        )
+        return _gather_kv_cuda_mod
+    except Exception:
+        _gather_kv_cuda_load_failed = True
+        _gather_kv_cuda_mod = None
+        return None
+
+
+_get_gather_kv_cuda()
+
 
 DTYPE_BYTES: dict[str, int] = {
     "float16": 2,
@@ -203,3 +242,59 @@ def gather_kv(
     gathered = gathered[:, :, :seq_len]
     # → (T, seq_len, 2, H, D)
     return gathered.permute(1, 2, 0, 3, 4).contiguous()
+
+
+def gather_kv_into_cpu(
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    target_indices: list[int] | torch.Tensor,
+    seq_len: int,
+    out: torch.Tensor,
+) -> None:
+    """Dense KV export: paged cache → preallocated pinned CPU buffer.
+
+    Selects rows ``block_tables[target_indices]``, gathers K/V block slices for
+    the first ``seq_len`` tokens per request, and writes directly into ``out``
+    via ``cudaHostGetDevicePointer`` — no intermediate GPU staging buffer is
+    allocated.
+
+    Args:
+        kv_cache: Paged layout
+            ``(2, num_blocks, block_size, num_kv_heads, head_dim)``.
+        block_tables: ``(num_requests, blocks_per_req)``, int64, same device
+            as ``kv_cache``.
+        target_indices: Which rows of ``block_tables`` to export.
+        seq_len: Sequence length; may be less than ``blocks_per_req * block_size``
+            (tail of the last block is unused).
+        out: **Pinned** CPU tensor ``(num_targets, seq_len, 2, num_kv_heads, head_dim)``
+            where ``num_targets`` is the leading size of ``target_indices``
+            (same as ``block_tables[target_indices].shape[0]``), dtype matching
+            ``kv_cache``. Must be allocated with ``pin_memory=True``.
+
+    Raises:
+        ValueError: If ``out`` is not a pinned CPU tensor, or dtype/shape do not match.
+    """
+    if out.device.type != "cpu":
+        raise ValueError("out must be a CPU tensor")
+    if not out.is_pinned():
+        raise ValueError(
+            "out must be pinned memory (allocate with pin_memory=True) so the "
+            "CUDA kernel can write directly to it without a staging buffer"
+        )
+
+    target_blocks = block_tables[target_indices].contiguous()
+    T, _ = target_blocks.shape
+    *_, H, D = kv_cache.shape
+
+    if out.dtype != kv_cache.dtype:
+        raise ValueError(
+            f"out dtype {out.dtype} must match kv_cache dtype {kv_cache.dtype}"
+        )
+    expected = (T, seq_len, 2, H, D)
+    if out.shape != expected:
+        raise ValueError(
+            f"out shape {tuple(out.shape)} does not match expected {expected}"
+        )
+
+    mod = _get_gather_kv_cuda()
+    mod.gather_kv_to_cpu(kv_cache, target_blocks, seq_len, out)

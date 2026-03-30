@@ -3,20 +3,21 @@
 Sender:
   1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
      populates it with multiple requests.
-  2. For each layer, gathers the target requests' KV on the GPU, serializes
-     the CUDA IPC memory handle and an interprocess event handle into a
-     small metadata blob, and sends header + blob over the Unix socket.
-     No D2H copy — the bulk tensor data stays on the GPU.
+  2. For each layer, IPC-shares the full layer paged ``kv_cache`` tensor
+     (not a pre-gathered export), serializes the CUDA IPC memory handle into a
+     small metadata blob, appends the target rows of the block table (int64)
+     for the receiver, and sends header + blob + block table over the Unix socket.
   3. Waits for a lightweight ACK before proceeding to the next layer.
      Keeps all exported GPU tensors alive until the transfer completes
      so the caching allocator cannot recycle their underlying CUDA blocks.
 
 Receiver:
-  1. Reads header + IPC metadata blob from the socket, sends ACK.
-  2. Reconstructs a GPU tensor in its own address space via
-     cudaIpcOpenMemHandle (PyTorch _new_shared_cuda), waits on the
-     sender's interprocess CUDA event for data visibility.
-  3. The received tensors are on GPU — no H2D copy needed.
+  1. Reads header + IPC metadata blob + packed target block table from the
+     socket, sends ACK.
+  2. Reconstructs the layer paged KV tensor in its own address space via
+     cudaIpcOpenMemHandle (PyTorch _new_shared_cuda).
+  3. Runs :func:`gather_kv_into_cpu` on GPU to copy the selected requests'
+     KV into a pinned CPU buffer (gather + D2H at the receiver).
 
 Requirements:
   - Linux only (CUDA IPC limitation).
@@ -29,6 +30,7 @@ Wire layout per layer:
   Header.to_bytes()   (60 + num_targets × 4 bytes)
   uint32 big-endian   length of IPC metadata blob
   IPC metadata blob   (pickled dict, KB-scale — not the tensor payload)
+  int64 big-endian    num_targets × blocks_per_req block IDs (target rows only)
 """
 
 import argparse
@@ -47,7 +49,7 @@ from kv_layout import (
     KVProfile,
     PagedKVPool,
     allocate_requests,
-    gather_kv,
+    gather_kv_into_cpu,
     load_kv_profile,
 )
 
@@ -65,6 +67,17 @@ def _unpack_ack(data: bytes) -> int:
     if len(data) != ACK_SIZE or data[0:1] != b"A":
         raise ValueError(f"Invalid ACK payload: {data!r}")
     return struct.unpack(">I", data[1:5])[0]
+
+
+def _pack_target_block_table(
+    block_tables: torch.Tensor,
+    target_indices: list[int],
+) -> bytes:
+    """Serialize target rows of the block table as big-endian int64 (CPU bytes)."""
+    tb = block_tables[target_indices].contiguous()
+    torch.cuda.synchronize()
+    flat = tb.cpu().view(-1).tolist()
+    return struct.pack(f">{len(flat)}q", *flat)
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -112,11 +125,8 @@ def _resolve_device_index(device_uuid: str) -> int:
 # -- IPC metadata serialization ------------------------------------------------
 
 
-def _serialize_ipc_meta(
-    tensor: torch.Tensor,
-    event: torch.cuda.Event,
-) -> bytes:
-    """Pickle the CUDA IPC handle, tensor metadata, and event handle."""
+def _serialize_ipc_meta(tensor: torch.Tensor) -> bytes:
+    """Pickle the CUDA IPC handle and tensor metadata."""
     storage = tensor.untyped_storage()
     handle = storage._share_cuda_()
     meta = {
@@ -126,13 +136,12 @@ def _serialize_ipc_meta(
         "stride": tuple(tensor.stride()),
         "storage_offset": tensor.storage_offset(),
         "device_uuid": _get_device_uuid(tensor.device.index),
-        "event_handle": event.ipc_handle(),
     }
     return pickle.dumps(meta)
 
 
-def _deserialize_ipc_tensor(blob: bytes) -> tuple[torch.Tensor, torch.cuda.Event]:
-    """Reconstruct a GPU tensor and interprocess event from pickled IPC metadata."""
+def _deserialize_ipc_tensor(blob: bytes) -> torch.Tensor:
+    """Reconstruct a GPU tensor from pickled IPC metadata."""
     meta = pickle.loads(blob)  # noqa: S301
     device_index = _resolve_device_index(meta["device_uuid"])
     device = torch.device(f"cuda:{device_index}")
@@ -143,9 +152,7 @@ def _deserialize_ipc_tensor(blob: bytes) -> tuple[torch.Tensor, torch.cuda.Event
 
     tensor = torch.empty((), device=device, dtype=meta["dtype"])
     tensor.set_(storage, meta["storage_offset"], meta["shape"], meta["stride"])
-
-    event = torch.cuda.Event.from_ipc_handle(device, meta["event_handle"])
-    return tensor, event
+    return tensor
 
 
 # -- sender -------------------------------------------------------------------
@@ -222,61 +229,42 @@ def run_sender(
             except (FileNotFoundError, ConnectionRefusedError):
                 time.sleep(0.5)
 
-        # Keep gathered tensors alive so the caching allocator doesn't recycle
-        # the underlying CUDA blocks while the receiver still has them mapped.
-        keepalive: list[torch.Tensor] = []
-
         transfer_start = time.perf_counter()
 
         for layer_idx in range(pool.num_layers):
             t0 = time.perf_counter()
-            gathered = gather_kv(
-                pool.kv_caches[layer_idx],
-                block_tables,
-                target_indices,
-                seq_len,
-            )
-
-            # Record interprocess event so the receiver can wait for
-            # the gather kernels to finish before reading the data.
-            event = torch.cuda.Event(interprocess=True)
-            event.record()
-            torch.cuda.synchronize()
-            gather_elapsed = time.perf_counter() - t0
-
+            kv_layer = pool.kv_caches[layer_idx]
             hdr = Header(layer_idx=layer_idx, **hdr_kwargs)
 
             # Serialize IPC handles (KB-scale, not the tensor payload)
-            t1 = time.perf_counter()
-            ipc_blob = _serialize_ipc_meta(gathered, event)
-            serialize_elapsed = time.perf_counter() - t1
+            t_serialize = time.perf_counter()
+            ipc_blob = _serialize_ipc_meta(kv_layer)
+            block_table_bytes = _pack_target_block_table(block_tables, target_indices)
+            serialize_elapsed = time.perf_counter() - t_serialize
 
-            # Send header + length-prefixed IPC blob
-            t2 = time.perf_counter()
+            # Send header + length-prefixed IPC blob + target block table
+            t_send = time.perf_counter()
             hdr_bytes = hdr.to_bytes()
             ipc_len = struct.pack(">I", len(ipc_blob))
-            sock.sendall(hdr_bytes + ipc_len + ipc_blob)
-            send_elapsed = time.perf_counter() - t2
+            sock.sendall(hdr_bytes + ipc_len + ipc_blob + block_table_bytes)
+            send_elapsed = time.perf_counter() - t_send
 
-            keepalive.append(gathered)
-
-            t3 = time.perf_counter()
+            t_ack = time.perf_counter()
             ack_layer = _unpack_ack(_recv_exact(sock, ACK_SIZE))
             if ack_layer != hdr.layer_idx:
                 raise RuntimeError(
                     f"ACK mismatch: expected {hdr.layer_idx}, got {ack_layer}"
                 )
-            ack_elapsed = time.perf_counter() - t3
+            ack_elapsed = time.perf_counter() - t_ack
 
             layer_elapsed = time.perf_counter() - t0
             logger.info(
                 "Layer %d/%d CUDA IPC sent in %.2f ms (%.2f MB/s). "
-                "Gather: %.2f ms, Serialize: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
+                "Serialize: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
                 hdr.layer_idx,
                 hdr.num_layers - 1,
                 layer_elapsed * 1000,
                 hdr.tensor_size / (1024**2) / layer_elapsed if layer_elapsed > 0 else 0,
-                gather_elapsed * 1000,
                 serialize_elapsed * 1000,
                 send_elapsed * 1000,
                 ack_elapsed * 1000,
@@ -298,52 +286,77 @@ def run_sender(
             total_bytes / (1024**2) / elapsed if elapsed > 0 else 0,
         )
 
-        keepalive.clear()
-
 
 # -- receiver -----------------------------------------------------------------
 
 
 def _process_layer(
     ipc_blob: bytes,
+    block_table_bytes: bytes,
     hdr: Header,
     logger: logging.Logger,
 ) -> torch.Tensor:
-    """Reconstruct GPU tensor from CUDA IPC metadata and wait for visibility."""
+    """Open paged KV via IPC, then gather selected requests' KV into CPU."""
     t0 = time.perf_counter()
-    ipc_tensor, event = _deserialize_ipc_tensor(ipc_blob)
-    event.synchronize()
+    kv_cache = _deserialize_ipc_tensor(ipc_blob)
 
-    expected_shape = (hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
-    if tuple(ipc_tensor.shape) != expected_shape:
+    expected_rank = 5
+    if kv_cache.dim() != expected_rank:
         raise RuntimeError(
-            f"Shape mismatch: expected {expected_shape}, got {tuple(ipc_tensor.shape)}"
+            f"Expected paged kv_cache rank {expected_rank}, got {kv_cache.dim()}"
+        )
+    if (
+        kv_cache.shape[2] != hdr.block_size
+        or kv_cache.shape[3] != hdr.num_kv_heads
+        or kv_cache.shape[4] != hdr.head_dim
+    ):
+        raise RuntimeError(
+            f"Paged KV shape mismatch vs header: got {tuple(kv_cache.shape)}, "
+            f"expected (*, *, {hdr.block_size}, {hdr.num_kv_heads}, {hdr.head_dim})"
         )
     deserialize_elapsed = time.perf_counter() - t0
 
-    t1 = time.perf_counter()
-    tensor = torch.empty(expected_shape, dtype=ipc_tensor.dtype, pin_memory=True)
-    pin_elapsed = time.perf_counter() - t1
+    t_unpack = time.perf_counter()
+    blocks_per_req = (hdr.seq_len + hdr.block_size - 1) // hdr.block_size
+    n_ids = hdr.num_targets * blocks_per_req
+    if len(block_table_bytes) != n_ids * 8:
+        raise RuntimeError(
+            f"Block table size mismatch: need {n_ids * 8} bytes, got {len(block_table_bytes)}"
+        )
+    flat = struct.unpack(f">{n_ids}q", block_table_bytes)
+    block_tables = torch.tensor(flat, dtype=torch.long, device=kv_cache.device).view(
+        hdr.num_targets,
+        blocks_per_req,
+    )
+    unpack_elapsed = time.perf_counter() - t_unpack
 
-    t2 = time.perf_counter()
-    tensor.copy_(ipc_tensor)
-    d2h_elapsed = time.perf_counter() - t2
+    out_shape = (hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
+    t_pin = time.perf_counter()
+    out = torch.empty(out_shape, dtype=kv_cache.dtype, pin_memory=True)
+    pin_elapsed = time.perf_counter() - t_pin
+
+    target_idx = list(range(hdr.num_targets))
+    t_gather = time.perf_counter()
+    gather_kv_into_cpu(kv_cache, block_tables, target_idx, hdr.seq_len, out)
+    torch.cuda.synchronize()
+    gather_elapsed = time.perf_counter() - t_gather
 
     elapsed = time.perf_counter() - t0
     logger.info(
         "Layer %d background done in %.1f ms (%.2f MB/s) → %s %s (device=%s). "
-        "Deserialize: %.2f ms, Pin: %.2f ms, D2H: %.2f ms.",
+        "Deserialize: %.2f ms, Unpack: %.2f ms, Pin: %.2f ms, Gather→CPU: %.2f ms.",
         hdr.layer_idx,
         elapsed * 1000,
         hdr.tensor_size / (1024**2) / elapsed if elapsed > 0 else 0,
-        tensor.shape,
-        tensor.dtype,
-        tensor.device,
+        out.shape,
+        out.dtype,
+        out.device,
         deserialize_elapsed * 1000,
+        unpack_elapsed * 1000,
         pin_elapsed * 1000,
-        d2h_elapsed * 1000,
+        gather_elapsed * 1000,
     )
-    return tensor
+    return out
 
 
 def run_receiver(socket_path: str):
@@ -382,16 +395,20 @@ def run_receiver(socket_path: str):
                 if num_layers is None:
                     num_layers = hdr.num_layers
 
-                # Read length-prefixed IPC metadata blob
+                # Read length-prefixed IPC metadata blob + target block table
                 ipc_len = struct.unpack(">I", _recv_exact(conn, 4))[0]
                 ipc_blob = _recv_exact(conn, ipc_len)
+                blocks_per_req = (hdr.seq_len + hdr.block_size - 1) // hdr.block_size
+                block_table_bytes = _recv_exact(
+                    conn, hdr.num_targets * blocks_per_req * 8
+                )
 
                 total_bytes += hdr.tensor_size
 
                 # ACK immediately — sender can proceed
                 conn.sendall(_pack_ack(hdr.layer_idx))
 
-                pending.append((ipc_blob, hdr))
+                pending.append((ipc_blob, block_table_bytes, hdr))
 
                 if hdr.layer_idx == num_layers - 1:
                     break
@@ -400,8 +417,13 @@ def run_receiver(socket_path: str):
             logger.info("All %d layers ACKed in %.2f s.", num_layers, recv_elapsed)
 
             results: dict[int, torch.Tensor] = {}
-            for ipc_blob, hdr in pending:
-                results[hdr.layer_idx] = _process_layer(ipc_blob, hdr, logger)
+            for ipc_blob, block_table_bytes, hdr in pending:
+                results[hdr.layer_idx] = _process_layer(
+                    ipc_blob,
+                    block_table_bytes,
+                    hdr,
+                    logger,
+                )
 
             # Final ACK for freeing the GPU tensors
             conn.sendall(_pack_ack(num_layers))
