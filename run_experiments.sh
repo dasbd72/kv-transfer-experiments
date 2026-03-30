@@ -26,6 +26,27 @@ Environment (optional):
 EOF
 }
 
+# PIDs of the current receiver/sender pair; cleared when a pair finishes so EXIT/INT/TERM only reap active children.
+PAIR_RECV_PID=
+PAIR_SEND_PID=
+
+cleanup_pair_children() {
+  if [[ -n "${PAIR_RECV_PID:-}" ]] && kill -0 "$PAIR_RECV_PID" 2>/dev/null; then
+    kill -TERM "$PAIR_RECV_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${PAIR_SEND_PID:-}" ]] && kill -0 "$PAIR_SEND_PID" 2>/dev/null; then
+    kill -TERM "$PAIR_SEND_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${PAIR_RECV_PID:-}" ]]; then
+    wait "$PAIR_RECV_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${PAIR_SEND_PID:-}" ]]; then
+    wait "$PAIR_SEND_PID" 2>/dev/null || true
+  fi
+  PAIR_RECV_PID=
+  PAIR_SEND_PID=
+}
+
 run_pair() {
   local name=$1
   local script=$2
@@ -41,8 +62,20 @@ run_pair() {
     >>"$log" 2>&1 &
   send_pid=$!
 
-  wait "$recv_pid" || status=1
-  wait "$send_pid" || status=1
+  PAIR_RECV_PID=$recv_pid
+  PAIR_SEND_PID=$send_pid
+
+  if ! wait "$recv_pid"; then
+    status=1
+    kill -TERM "$send_pid" 2>/dev/null || true
+  fi
+  PAIR_RECV_PID=
+
+  if ! wait "$send_pid"; then
+    status=1
+  fi
+  PAIR_SEND_PID=
+
   return "$status"
 }
 
@@ -65,6 +98,10 @@ case "$TEST" in
     exit 1
     ;;
 esac
+
+trap cleanup_pair_children EXIT
+trap 'cleanup_pair_children; exit 130' INT
+trap 'cleanup_pair_children; exit 143' TERM
 
 mkdir -p logs "$SOCK_DIR"
 
