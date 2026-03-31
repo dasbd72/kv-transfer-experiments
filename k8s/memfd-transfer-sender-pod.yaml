@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kv-transfer-memfd-sender
+  labels:
+    app: kv-transfer
+    test: memfd
+    role: sender
+spec:
+  restartPolicy: Never
+  # Must match receiver pod nodeSelector so they land on same node.
+  # nodeSelector:
+  #   kv-transfer-node: "true"
+  volumes:
+    - name: sock
+      hostPath:
+        path: /tmp/shared_sock
+        type: DirectoryOrCreate
+    - name: model-storage
+      persistentVolumeClaim:
+        claimName: vllm-model-storage-pvc
+        readOnly: true
+  containers:
+    - name: sender
+      image: dasbd72/experiment-kv-transfer:latest
+      imagePullPolicy: Always
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      env:
+        - name: MODEL
+          value: /models/Qwen3-0.6B
+        - name: NUM_REQUESTS
+          value: "32"
+        - name: SEQ_LEN
+          value: "2048"
+        - name: TARGET_COUNT
+          value: "16"
+        - name: SOCK_DIR
+          value: /sock
+      volumeMounts:
+        - name: sock
+          mountPath: /sock
+        - name: model-storage
+          mountPath: /models
+          readOnly: true
+      command: ["bash", "-lc"]
+      args:
+        - |
+          set -euo pipefail
+          mkdir -p "${SOCK_DIR}"
+          python3 /app/memfd_transfer.py --sender --socket-path "${SOCK_DIR}/memfd.sock" \
+            --model "${MODEL}" \
+            --num-requests "${NUM_REQUESTS}" \
+            --seq-len "${SEQ_LEN}" \
+            --target-count "${TARGET_COUNT}"

@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kv-transfer-memfd-receiver
+  labels:
+    app: kv-transfer
+    test: memfd
+    role: receiver
+spec:
+  restartPolicy: Never
+  # IMPORTANT: sender must run on the same node to use AF_UNIX + FD passing.
+  # Option A: label a GPU node and use this selector in BOTH pods:
+  #   kubectl label node <node> kv-transfer-node=true
+  # nodeSelector:
+  #   kv-transfer-node: "true"
+  volumes:
+    - name: sock
+      hostPath:
+        path: /tmp/shared_sock
+        type: DirectoryOrCreate
+  containers:
+    - name: receiver
+      image: dasbd72/experiment-kv-transfer:latest
+      imagePullPolicy: Always
+      env:
+        - name: SOCK_DIR
+          value: /sock
+      volumeMounts:
+        - name: sock
+          mountPath: /sock
+      command: ["bash", "-lc"]
+      args:
+        - |
+          set -euo pipefail
+          mkdir -p "${SOCK_DIR}"
+          python3 /app/memfd_transfer.py --receiver --socket-path "${SOCK_DIR}/memfd.sock"
