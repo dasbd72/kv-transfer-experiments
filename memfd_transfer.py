@@ -3,9 +3,10 @@
 Sender:
   1. Allocates a real GPU paged KV pool (vLLM FlashAttention layout) and
      populates it with multiple requests.
-  2. For each layer, creates an mmap'd memfd (size rounded up to a host
-     page), registers the mapping with cudaHostRegister, then runs
-     :func:`gather_kv_into_cpu` into the mmap payload (CUDA gather + D2H).
+  2. For each layer, creates an mmap'd memfd, then runs
+     :func:`gather_kv_into_cpu` (CUDA gather + D2H into
+     a pre-allocated pinned buffer) and copies the result into the mmap
+     payload.
   3. Sends the memfd fd and waits for a lightweight ACK before proceeding
      to the next layer.
 
@@ -21,7 +22,6 @@ Wire layout per layer (after v3 header):
 """
 
 import argparse
-import ctypes
 import logging
 import mmap
 import os
@@ -44,40 +44,6 @@ from kv_layout import (
 )
 
 ACK_SIZE = 5  # b"A" + big-endian uint32 layer index
-
-# cudaHostRegisterPortable — same flag as torch.cuda._pin_memory_utils.pin_memory
-_CUDA_HOST_REGISTER_PORTABLE = 1
-
-# Payload must be 16-byte aligned so gather_kv_cuda.cu can use the vectorized
-# (uint4) path.  mmap bases are always page-aligned, so aligning the *offset*
-# of the payload within the file is sufficient.
-_PAYLOAD_ALIGN = 16  # sizeof(uint4)
-
-
-def _round_up(nbytes: int, align: int) -> int:
-    return (nbytes + align - 1) // align * align
-
-
-def _round_up_page(nbytes: int, page: int) -> int:
-    return _round_up(nbytes, page)
-
-
-def _cuda_host_register(ptr: int, nbytes: int) -> None:
-    """Pin existing host memory for fast DMA (wraps cudaHostRegister)."""
-    err = int(
-        torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_PORTABLE)
-    )
-    if err != 0:
-        raise RuntimeError(
-            f"cudaHostRegister failed with error code {err}. "
-            "Set CUDA_LAUNCH_BLOCKING=1 if this may mask an earlier async CUDA error."
-        )
-
-
-def _cuda_host_unregister(ptr: int) -> None:
-    err = int(torch.cuda.cudart().cudaHostUnregister(ptr))
-    if err != 0:
-        raise RuntimeError(f"cudaHostUnregister failed with error code {err}")
 
 
 # -- ACK helpers --------------------------------------------------------------
@@ -177,10 +143,16 @@ def run_sender(
         target_indices=tuple(target_indices),
     )
     hdr_size = Header(layer_idx=0, **hdr_kwargs).total_header_size
-    payload_offset = _round_up(hdr_size, _PAYLOAD_ALIGN)
-    file_size = payload_offset + export_bytes
-    page = os.sysconf("SC_PAGE_SIZE")
-    map_size = _round_up_page(file_size, page)
+    file_size = hdr_size + export_bytes
+
+    t_pin = time.perf_counter()
+    pinned = torch.empty(
+        (num_targets, seq_len, 2, pool.num_kv_heads, pool.head_dim),
+        dtype=dtype,
+        pin_memory=True,
+    )
+    pin_elapsed = time.perf_counter() - t_pin
+    logger.info("Pin: %.2f ms", pin_elapsed * 1000)
 
     # 2. Connect and transfer
     logger.info("Connecting to %s ...", socket_path)
@@ -199,22 +171,15 @@ def run_sender(
             t0 = time.perf_counter()
             hdr = Header(layer_idx=layer_idx, **hdr_kwargs)
 
-            # Create memfd, size it, mmap; register full mapping for pinned D2H
             fd = os.memfd_create(f"kv_layer_{layer_idx}")
-            os.ftruncate(fd, map_size)
-            mm = mmap.mmap(fd, map_size)
-            whole = (ctypes.c_byte * map_size).from_buffer(mm, 0)
-            base_ptr = ctypes.addressof(whole)
+            os.ftruncate(fd, file_size)
+            mm = mmap.mmap(fd, file_size)
             mmap_objects.append(mm)
-
-            t_register = time.perf_counter()
-            _cuda_host_register(base_ptr, map_size)
-            register_elapsed = time.perf_counter() - t_register
 
             out = torch.frombuffer(
                 mm,
                 dtype=dtype,
-                offset=payload_offset,
+                offset=hdr_size,
                 count=export_numel,
             ).reshape(
                 num_targets,
@@ -232,18 +197,16 @@ def run_sender(
                 block_tables,
                 target_indices,
                 seq_len,
-                out,
+                pinned,
             )
             torch.cuda.synchronize()
             gather_elapsed = time.perf_counter() - t_gather
 
-            del out
-            del whole
-            t_unregister = time.perf_counter()
-            _cuda_host_unregister(base_ptr)
-            unregister_elapsed = time.perf_counter() - t_unregister
+            t_copy = time.perf_counter()
+            out.copy_(pinned)
+            copy_elapsed = time.perf_counter() - t_copy
 
-            pin_elapsed = register_elapsed + unregister_elapsed
+            del out
 
             t2 = time.perf_counter()
             socket.send_fds(sock, [b"1"], [fd])
@@ -261,14 +224,14 @@ def run_sender(
             layer_elapsed = time.perf_counter() - t0
             logger.info(
                 "Layer %d/%d memfd sent in %.2f ms (%.2f MB/s). "
-                "Gather→CPU: %.2f ms, Pin: %.2f ms, "
+                "Gather: %.2f ms, Copy: %.2f ms, "
                 "Send: %.2f ms, Ack: %.2f ms.",
                 hdr.layer_idx,
                 hdr.num_layers - 1,
                 layer_elapsed * 1000,
                 hdr.tensor_size / (1024**2) / layer_elapsed if layer_elapsed > 0 else 0,
                 gather_elapsed * 1000,
-                pin_elapsed * 1000,
+                copy_elapsed * 1000,
                 send_elapsed * 1000,
                 ack_elapsed * 1000,
             )
@@ -313,11 +276,10 @@ def _process_layer(
     dtype = TORCH_DTYPE[dtype_name]
     num_elements = hdr.tensor_size // DTYPE_BYTES[dtype_name]
 
-    payload_offset = _round_up(hdr.total_header_size, _PAYLOAD_ALIGN)
     tensor = torch.frombuffer(
         mm,
         dtype=dtype,
-        offset=payload_offset,
+        offset=hdr.total_header_size,
         count=num_elements,
     ).reshape(hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
 

@@ -193,7 +193,7 @@ def run_sender(
             layer_elapsed = time.perf_counter() - t0
             logger.info(
                 "Layer %d/%d socket sent in %.2f ms (%.2f MB/s). "
-                "Gather→CPU: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
+                "Gather: %.2f ms, Send: %.2f ms, Ack: %.2f ms.",
                 hdr.layer_idx,
                 hdr.num_layers - 1,
                 layer_elapsed * 1000,

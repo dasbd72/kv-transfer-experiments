@@ -16,8 +16,10 @@ Receiver:
      socket, sends ACK.
   2. Reconstructs the layer paged KV tensor in its own address space via
      cudaIpcOpenMemHandle (PyTorch _new_shared_cuda).
-  3. Runs :func:`gather_kv_into_cpu` on GPU to copy the selected requests'
-     KV into a pinned CPU buffer (gather + D2H at the receiver).
+  3. After every layer is received and ACKed, allocates one reusable pinned CPU
+     staging buffer (shape/dtype from the header).  Per layer, runs
+     :func:`gather_kv_into_cpu` into that buffer (GPU gather + D2H), then copies
+     into a pageable CPU result tensor.
 
 Requirements:
   - Linux only (CUDA IPC limitation).
@@ -44,8 +46,9 @@ import random
 
 import torch
 
-from header import DTYPE_ID, Header
+from header import DTYPE_ID, ID_TO_DTYPE_NAME, Header
 from kv_layout import (
+    TORCH_DTYPE,
     KVProfile,
     PagedKVPool,
     allocate_requests,
@@ -295,6 +298,7 @@ def _process_layer(
     block_table_bytes: bytes,
     hdr: Header,
     logger: logging.Logger,
+    pinned: torch.Tensor,
 ) -> torch.Tensor:
     """Open paged KV via IPC, then gather selected requests' KV into CPU."""
     t0 = time.perf_counter()
@@ -331,20 +335,22 @@ def _process_layer(
     unpack_elapsed = time.perf_counter() - t_unpack
 
     out_shape = (hdr.num_targets, hdr.seq_len, 2, hdr.num_kv_heads, hdr.head_dim)
-    t_pin = time.perf_counter()
-    out = torch.empty(out_shape, dtype=kv_cache.dtype, pin_memory=True)
-    pin_elapsed = time.perf_counter() - t_pin
+    out = torch.empty(out_shape, dtype=kv_cache.dtype)
 
     target_idx = list(range(hdr.num_targets))
     t_gather = time.perf_counter()
-    gather_kv_into_cpu(kv_cache, block_tables, target_idx, hdr.seq_len, out)
+    gather_kv_into_cpu(kv_cache, block_tables, target_idx, hdr.seq_len, pinned)
     torch.cuda.synchronize()
     gather_elapsed = time.perf_counter() - t_gather
+
+    t_copy = time.perf_counter()
+    out.copy_(pinned)
+    copy_elapsed = time.perf_counter() - t_copy
 
     elapsed = time.perf_counter() - t0
     logger.info(
         "Layer %d background done in %.1f ms (%.2f MB/s) → %s %s (device=%s). "
-        "Deserialize: %.2f ms, Unpack: %.2f ms, Pin: %.2f ms, Gather→CPU: %.2f ms.",
+        "Deserialize: %.2f ms, Unpack: %.2f ms, Gather: %.2f ms, Copy: %.2f ms.",
         hdr.layer_idx,
         elapsed * 1000,
         hdr.tensor_size / (1024**2) / elapsed if elapsed > 0 else 0,
@@ -353,8 +359,8 @@ def _process_layer(
         out.device,
         deserialize_elapsed * 1000,
         unpack_elapsed * 1000,
-        pin_elapsed * 1000,
         gather_elapsed * 1000,
+        copy_elapsed * 1000,
     )
     return out
 
@@ -378,7 +384,7 @@ def run_receiver(socket_path: str):
         conn, _ = server.accept()
         with conn:
             # No background processing here to avoid blocking the main thread.
-            pending: list[tuple[bytes, Header]] = []
+            pending: list[tuple[bytes, bytes, Header]] = []
             transfer_start = time.perf_counter()
             num_layers: int | None = None
             total_bytes = 0
@@ -416,6 +422,20 @@ def run_receiver(socket_path: str):
             recv_elapsed = time.perf_counter() - transfer_start
             logger.info("All %d layers ACKed in %.2f s.", num_layers, recv_elapsed)
 
+            t_pin = time.perf_counter()
+            hdr = pending[0][2]
+            out_shape = (
+                hdr.num_targets,
+                hdr.seq_len,
+                2,
+                hdr.num_kv_heads,
+                hdr.head_dim,
+            )
+            dtype = TORCH_DTYPE[ID_TO_DTYPE_NAME[hdr.dtype_id]]
+            pinned = torch.empty(out_shape, dtype=dtype, pin_memory=True)
+            pin_elapsed = time.perf_counter() - t_pin
+            logger.info("Pin: %.2f ms", pin_elapsed * 1000)
+
             results: dict[int, torch.Tensor] = {}
             for ipc_blob, block_table_bytes, hdr in pending:
                 results[hdr.layer_idx] = _process_layer(
@@ -423,6 +443,7 @@ def run_receiver(socket_path: str):
                     block_table_bytes,
                     hdr,
                     logger,
+                    pinned,
                 )
 
             # Final ACK for freeing the GPU tensors
