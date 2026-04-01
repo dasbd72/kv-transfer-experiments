@@ -109,8 +109,11 @@ failed=0
 case "$TEST" in
   all)
     run_shm    || failed=1
+    sleep 10
     run_memfd  || failed=1
+    sleep 10
     run_socket || failed=1
+    sleep 10
     run_cuda   || failed=1
     ;;
   shm)    run_shm    || failed=1 ;;
