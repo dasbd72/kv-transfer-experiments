@@ -33,7 +33,7 @@ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 # Copy the rest of the application code
 WORKDIR /app
 
-COPY header.py kv_layout.py shm_transfer.py memfd_transfer.py socket_transfer.py cuda_ipc_transfer.py ./
+COPY setup.py pyproject.toml header.py kv_layout.py shm_transfer.py memfd_transfer.py socket_transfer.py cuda_ipc_transfer.py ./
 COPY csrc/*.cu csrc/*.cpp ./csrc/
-# Run once to pre-compile the CUDA kernels
-RUN python3 kv_layout.py
+RUN uv pip install setuptools wheel \
+    && uv pip install . --no-build-isolation

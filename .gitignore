@@ -2,3 +2,7 @@ __pycache__/
 .venv/
 *.pyc
 logs/
+build/
+dist/
+*.egg-info/
+*.so

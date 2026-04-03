@@ -9,19 +9,18 @@ MLA / FP8 / other non-standard cache formats use a different formula and
 are NOT supported here; load_kv_profile() will raise for unsupported dtypes.
 """
 
-import os
 from dataclasses import dataclass
 
 import torch
 from transformers import AutoConfig
 
-# JIT CUDA extension for gather (avoids Triton kernel compile/cold start on each process).
+# Prebuilt CUDA extension (``pip install -e .`` or ``python setup.py build_ext --inplace``).
 _gather_kv_cuda_mod: object | None = None
 _gather_kv_cuda_load_failed = False
 
 
 def _get_gather_kv_cuda():
-    """Load ``csrc/gather_kv*.`` once; return module or None if unavailable."""
+    """Import the installed ``gather_kv_cuda`` extension; return module or None."""
     global _gather_kv_cuda_mod, _gather_kv_cuda_load_failed
     if _gather_kv_cuda_load_failed:
         return None
@@ -31,26 +30,14 @@ def _get_gather_kv_cuda():
         if not torch.cuda.is_available():
             _gather_kv_cuda_load_failed = True
             return None
-        from torch.utils.cpp_extension import load
+        import gather_kv_cuda
 
-        _dir = os.path.dirname(os.path.abspath(__file__))
-        _gather_kv_cuda_mod = load(
-            name="gather_kv_cuda",
-            sources=[
-                os.path.join(_dir, "csrc", "gather_kv.cpp"),
-                os.path.join(_dir, "csrc", "gather_kv_cuda.cu"),
-            ],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
-            verbose=False,
-        )
+        _gather_kv_cuda_mod = gather_kv_cuda
         return _gather_kv_cuda_mod
     except Exception:
         _gather_kv_cuda_load_failed = True
         _gather_kv_cuda_mod = None
         return None
-
-
-_get_gather_kv_cuda()
 
 
 DTYPE_BYTES: dict[str, int] = {
